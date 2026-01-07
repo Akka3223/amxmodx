@@ -74,6 +74,74 @@ static int listline=-1; /* "current line" for the list file */
 static stkitem *stack=NULL;
 static int stkidx=0,stktop=0;
 
+/* A lightweight include resolution cache to avoid repeated path scanning
+ * for the same include from the same base directory and flags. This does not
+ * change semantics; it only memoizes the resolved full path (or failure).
+ */
+typedef struct include_cache_entry {
+  char *base;               /* base directory of the including file (may be empty) */
+  char *name;               /* include name as written (e.g., "foo.inc") */
+  char *resolved;           /* resolved full path used for inclusion (if found) */
+  int try_currentpath;      /* whether current path was considered */
+  int try_includepaths;     /* whether include paths were considered */
+  int found;                /* TRUE if resolution succeeded, FALSE otherwise */
+} include_cache_entry;
+
+static include_cache_entry *include_cache = NULL;
+static int include_cache_count = 0;
+static int include_cache_cap = 0;
+
+static int include_cache_lookup(const char *base,
+                                const char *name,
+                                int try_currentpath,
+                                int try_includepaths,
+                                const char **resolved_out)
+{
+  int i;
+  for (i = 0; i < include_cache_count; i++) {
+    include_cache_entry *e = &include_cache[i];
+    if (e->try_currentpath == try_currentpath &&
+        e->try_includepaths == try_includepaths &&
+        strcmp(e->name, name) == 0 &&
+        strcmp(e->base, base) == 0) {
+      if (e->found) {
+        *resolved_out = e->resolved;
+        return 1; /* cached success */
+      }
+      return 0;   /* cached failure */
+    }
+  }
+  return -1;       /* not found */
+}
+
+static void include_cache_store(const char *base,
+                                const char *name,
+                                int try_currentpath,
+                                int try_includepaths,
+                                int found,
+                                const char *resolved)
+{
+  if (include_cache_count == include_cache_cap) {
+    int newcap = (include_cache_cap == 0) ? 32 : include_cache_cap * 2;
+    include_cache_entry *newarr = (include_cache_entry*)malloc(newcap * sizeof(include_cache_entry));
+    if (newarr == NULL)
+      return; /* on OOM, silently skip caching */
+    if (include_cache) {
+      memcpy(newarr, include_cache, include_cache_count * sizeof(include_cache_entry));
+      free(include_cache);
+    }
+    include_cache = newarr;
+    include_cache_cap = newcap;
+  }
+  include_cache_entry *e = &include_cache[include_cache_count++];
+  e->base = duplicatestring((char*)base);
+  e->name = duplicatestring((char*)name);
+  e->resolved = (found && resolved != NULL) ? duplicatestring((char*)resolved) : NULL;
+  e->try_currentpath = try_currentpath;
+  e->try_includepaths = try_includepaths;
+  e->found = found;
+}
+
 SC_FUNC void pushstk(stkitem val)
 {
   assert(stkidx<=stktop);
@@ -174,9 +242,40 @@ static char *extensions[] = { ".inc", ".p", ".pawn" };
 SC_FUNC int plungefile(char *name,int try_currentpath,int try_includepaths)
 {
   int result=FALSE;
+  char usedpath[_MAX_PATH];
+  usedpath[0] = '\0';
+
+  /* Determine base directory for caching when try_currentpath is enabled. */
+  char basedir[_MAX_PATH];
+  basedir[0] = '\0';
+  if (try_currentpath) {
+    char *ptr;
+    if ((ptr=strrchr(inpfname,DIRSEP_CHAR))!=0) {
+      int len=(int)(ptr-inpfname)+1;
+      if (len < (int)sizeof(basedir)) {
+        strncpy(basedir,inpfname,len);
+        basedir[len] = '\0';
+      }
+    }
+  }
+
+  /* Check cache first. */
+  {
+    const char *resolved_out = NULL;
+    int cstate = include_cache_lookup(basedir, name, try_currentpath, try_includepaths, &resolved_out);
+    if (cstate == 1) {
+      return plungequalifiedfile((char*)resolved_out);
+    } else if (cstate == 0) {
+      return FALSE;
+    }
+  }
 
   if (try_currentpath) {
     result=plungequalifiedfile(name);
+    if (result) {
+      strncpy(usedpath, name, sizeof(usedpath));
+      usedpath[sizeof(usedpath) - 1] = '\0';
+    }
     if (!result) {
       /* failed to open the file in the active directory, try to open the file
        * in the same directory as the current file --but first check whether
@@ -190,6 +289,10 @@ SC_FUNC int plungefile(char *name,int try_currentpath,int try_includepaths)
           strncpy(path,inpfname,len);
           strcpy(path+len,name);
           result=plungequalifiedfile(path);
+          if (result) {
+            strncpy(usedpath, path, sizeof(usedpath));
+            usedpath[sizeof(usedpath) - 1] = '\0';
+          }
         } /* if */
       } /* if */
     } /* if */
@@ -205,8 +308,15 @@ SC_FUNC int plungefile(char *name,int try_currentpath,int try_includepaths)
       strncat(path,name,sizeof(path) - strlen(path) - 1);
       path[sizeof path - 1]='\0';
       result=plungequalifiedfile(path);
+      if (result) {
+        strncpy(usedpath, path, sizeof(usedpath));
+        usedpath[sizeof(usedpath) - 1] = '\0';
+      }
     } /* while */
   } /* if */
+
+  /* Store in cache to avoid repeated resolution work. */
+  include_cache_store(basedir, name, try_currentpath, try_includepaths, result, result ? usedpath : NULL);
   return result;
 }
 
@@ -1221,9 +1331,19 @@ static int command(void)
     for (i=0; i<40 && (isalpha(*lptr) || *lptr=='.'); i++,lptr++)
       name[i]=(char)tolower(*lptr);
     name[i]='\0';
-    stgwrite("\t");
-    stgwrite(name);
-    stgwrite(" ");
+    {
+      char line[64];
+      int ln = 0;
+      line[ln++] = '\t';
+      {
+        int k;
+        for (k=0; name[k] != '\0' && ln < (int)sizeof(line)-2; k++)
+          line[ln++] = name[k];
+      }
+      line[ln++] = ' ';
+      line[ln] = '\0';
+      stgwrite(line);
+    }
     code_idx+=opcodes(1);
     /* write parameter (if any) */
     while (*lptr<=' ' && *lptr!='\0')
@@ -2517,6 +2637,8 @@ static symbol *add_symbol(symbol *root,symbol *entry,int sort)
   root->next=newsym;
   if (global)
     AddToHashTable(sp_Globals, newsym);
+  else
+    AddToHashTableFront(sp_Locals, newsym);
   return newsym;
 }
 
@@ -2574,6 +2696,8 @@ SC_FUNC void delete_symbol(symbol *root,symbol *sym)
 
   if (origRoot==&glbtab)
     RemoveFromHashTable(sp_Globals, sym);
+  else if (origRoot==&loctab)
+    RemoveFromHashTable(sp_Locals, sym);
 
   /* unlink it, then free it */
   root->next=sym->next;
@@ -2593,7 +2717,7 @@ SC_FUNC int get_actual_compound(symbol *sym)
 SC_FUNC void delete_symbols(symbol *root,int level,int delete_labels,int delete_functions)
 {
   symbol *base;
-  symbol *sym,*parent_sym,*child_sym;
+  symbol *sym,*parent_sym;
   constvalue *stateptr;
   int mustdelete=0;
 
@@ -2651,22 +2775,36 @@ SC_FUNC void delete_symbols(symbol *root,int level,int delete_labels,int delete_
       break;
     } /* switch */
     if (mustdelete) {
-      /* first delete children, if any */
-      int count=0;
-      while ((child_sym=finddepend(sym))!=NULL) {
-        delete_symbol(root,child_sym);
-        count++;
-      } /* while */
-      if (count==0) {
+      /* delete children in a single pass to avoid repeated O(n^2) scans */
+      int count = 0;
+      symbol *prev = root;
+      symbol *iter = root->next;
+      while (iter != NULL) {
+        if (iter->parent == sym) {
+          symbol *tod = iter;
+          iter = iter->next;
+          prev->next = iter;
+          if (root == &glbtab)
+            RemoveFromHashTable(sp_Globals, tod);
+          free_symbol(tod);
+          count++;
+          continue;
+        }
+        prev = iter;
+        iter = iter->next;
+      }
+      if (count == 0) {
         if (root == &glbtab)
           RemoveFromHashTable(sp_Globals, sym);
-        base->next=sym->next;
+        else if (root == &loctab)
+          RemoveFromHashTable(sp_Locals, sym);
+        base->next = sym->next;
         free_symbol(sym);
       } else {
         /* chain has changed */
-        delete_symbol(root,sym);
-        base=root;      /* restart */
-      } /* if */
+        delete_symbol(root, sym);
+        base = root;      /* restart */
+      }
     } else {
       /* if the function was prototyped, but not implemented in this source,
        * mark it as such, so that its use can be flagged
@@ -2701,10 +2839,15 @@ static symbol *find_symbol(const symbol *root,const char *name,int fnumber,int i
   symbol *ptr=root->next;
   unsigned long hash=NameHash(name);
   while (ptr!=NULL) {
-    if (hash==ptr->hash && strcmp(name,ptr->name)==0
-        && (ptr->parent==NULL || includechildren)
-        && (fnumber<0 || (ptr->fnumber<0 || ptr->fnumber==fnumber)))
-      return ptr;
+    /* Fast path: check hash first, skip string compare if no match.
+     * Symbols are inserted in hash order within each scope, so we can
+     * skip past symbols with smaller/different hashes quickly. */
+    if (hash==ptr->hash) {
+      if (strcmp(name,ptr->name)==0
+          && (ptr->parent==NULL || includechildren)
+          && (fnumber<0 || (ptr->fnumber<0 || ptr->fnumber==fnumber)))
+        return ptr;
+    } /* if hash matches */
     ptr=ptr->next;
   } /* while */
   return NULL;
@@ -2794,7 +2937,25 @@ SC_FUNC void markusage(symbol *sym,int usage)
  */
 SC_FUNC symbol *findglb(const char *name)
 {
-  return find_symbol(&glbtab,name,fcurrent,FALSE);
+  if (!sp_Globals)
+    return find_symbol(&glbtab,name,fcurrent,FALSE);
+  /* Fast global lookup via hash table, but preserve original
+   * semantics: only return top-level globals (parent == NULL).
+   */
+  uint32_t hash = NameHash(name);
+  uint32_t bucket = hash & sp_Globals->bucketmask;
+  HashEntry *he = sp_Globals->buckets[bucket];
+  while (he != NULL) {
+    symbol *sym = he->sym;
+    if (sym->parent == NULL &&
+        (sym->fnumber < 0 || sym->fnumber == fcurrent) &&
+        strcmp(sym->name, name) == 0)
+    {
+      return sym;
+    }
+    he = he->next;
+  }
+  return NULL;
 }
 
 /*  findloc
@@ -2804,7 +2965,19 @@ SC_FUNC symbol *findglb(const char *name)
  */
 SC_FUNC symbol *findloc(const char *name)
 {
-  return find_symbol(&loctab,name,-1,FALSE);
+  if (!sp_Locals)
+    return find_symbol(&loctab,name,-1,FALSE);
+  /* Latest local first thanks to head insertion in buckets. */
+  uint32_t hash = NameHash(name);
+  uint32_t bucket = hash & sp_Locals->bucketmask;
+  HashEntry *he = sp_Locals->buckets[bucket];
+  while (he != NULL) {
+    symbol *sym = he->sym;
+    if (sym->parent == NULL && strcmp(sym->name, name) == 0)
+      return sym;
+    he = he->next;
+  }
+  return NULL;
 }
 
 SC_FUNC symbol *findconst(const char *name)
@@ -2930,10 +3103,11 @@ SC_FUNC int getlabel(void)
  */
 SC_FUNC char *itoh(ucell val)
 {
-static char itohstr[30];
-  char *ptr;
-  int i,nibble[16];             /* a 64-bit hexadecimal cell has 16 nibbles */
+  static char itohstr[30];
+  static const char hex[] = "0123456789abcdef";
+  char *ptr = itohstr;
   int max;
+  int shift;
 
   #if PAWN_CELL_SIZE==16
     max=4;
@@ -2944,22 +3118,24 @@ static char itohstr[30];
   #else
     #error Unsupported cell size
   #endif
-  ptr=itohstr;
-  for (i=0; i<max; i+=1){
-    nibble[i]=(int)(val & 0x0f);        /* nibble 0 is lowest nibble */
-    val>>=4;
-  } /* endfor */
-  i=max-1;
-  while (nibble[i]==0 && i>0)   /* search for highest non-zero nibble */
-    i-=1;
-  while (i>=0){
-    if (nibble[i]>=10)
-      *ptr++=(char)('a'+(nibble[i]-10));
-    else
-      *ptr++=(char)('0'+nibble[i]);
-    i-=1;
-  } /* while */
-  *ptr='\0';            /* and a zero-terminator */
+
+  /* Find highest non-zero nibble (or 0 if value is zero). */
+  if (val == 0) {
+    *ptr++ = '0';
+    *ptr = '\0';
+    return itohstr;
+  }
+
+  shift = (max - 1) * 4;
+  while (shift > 0 && ((val >> shift) & 0xF) == 0)
+    shift -= 4;
+
+  /* Emit hex digits from highest nibble downwards. */
+  while (shift >= 0) {
+    *ptr++ = hex[(val >> shift) & 0xF];
+    shift -= 4;
+  }
+  *ptr = '\0';
   return itohstr;
 }
 

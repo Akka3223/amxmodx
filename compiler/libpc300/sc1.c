@@ -510,6 +510,9 @@ int pc_compile(int argc, char *argv[])
   sp_Globals = NewHashTable();
   if (!sp_Globals)
     error(123);
+  sp_Locals = NewHashTable();
+  if (!sp_Locals)
+    error(123);
 
   /* allocate memory for fixed tables */
   inpfname=(char*)malloc(_MAX_PATH);
@@ -624,6 +627,11 @@ int pc_compile(int argc, char *argv[])
   /* do the first pass through the file (or possibly two or more "first passes") */
   sc_parsenum=0;
   inpfmark=pc_getpossrc(inpf_org);
+  
+  /* ===== INSTRUMENTATION: Start FIRST pass timing ===== */
+  {
+    clock_t t1_first = clock();
+  
   do {
     /* reset "defined" flag of all functions and global variables */
     reduce_referrers(&glbtab);
@@ -660,6 +668,12 @@ int pc_compile(int argc, char *argv[])
     parse();                            /* process all input */
     sc_parsenum++;
   } while (sc_reparse);
+  
+  /* ===== INSTRUMENTATION: End FIRST pass ===== */
+    clock_t t2_first = clock();
+    fprintf(stderr, "[TIMING] FIRST pass: %.3f sec\n", (double)(t2_first - t1_first) / CLOCKS_PER_SEC);
+  }
+  /* ===== END INSTRUMENTATION ===== */
 
   /* second (or third) pass */
   sc_status=statWRITE;                  /* set, to enable warnings */
@@ -714,6 +728,11 @@ int pc_compile(int argc, char *argv[])
   fline=skipinput;              /* reset line number */
   lexinit();                    /* clear internal flags of lex() */
   sc_status=statWRITE;          /* allow to write --this variable was reset by resetglobals() */
+  
+  /* ===== INSTRUMENTATION: Start WRITE phase timing ===== */
+  {
+    clock_t t1_write = clock();
+  
   writeleader(&glbtab);
   insert_dbgfile(inpfname);     /* attach to debug information */
   insert_inputfile(inpfname);   /* save for the error system */
@@ -727,6 +746,12 @@ int pc_compile(int argc, char *argv[])
   parse();                              /* process all input */
   /* inpf is already closed when readline() attempts to pop of a file */
   writetrailer();                       /* write remaining stuff */
+  
+  /* ===== INSTRUMENTATION: End WRITE phase ===== */
+    clock_t t2_write = clock();
+    fprintf(stderr, "[TIMING] WRITE phase: %.3f sec\n", (double)(t2_write - t1_write) / CLOCKS_PER_SEC);
+  }
+  /* ===== END INSTRUMENTATION ===== */
 
   entry=testsymbols(&glbtab,0,TRUE,FALSE);  /* test for unused or undefined
                                              * functions and variables */
@@ -828,6 +853,7 @@ cleanup:
                                            * done (i.e. on a fatal error) */
   delete_symbols(&glbtab,0,TRUE,TRUE);
   DestroyHashTable(sp_Globals);
+  DestroyHashTable(sp_Locals);
   delete_consttable(&tagname_tab);
   delete_consttable(&libname_tab);
   delete_consttable(&sc_automaton_tab);
@@ -1549,7 +1575,7 @@ static void setconstants(void)
   #endif
   add_constant("charbits",sCHARBITS,sGLOBAL,0);
   add_constant("charmin",0,sGLOBAL,0);
-  add_constant("charmax",~(-1UL << sCHARBITS) - 1,sGLOBAL,0);
+  add_constant("charmax",~((~0UL) << sCHARBITS) - 1,sGLOBAL,0);
   add_constant("ucharmax",(1 << (sizeof(cell)-1)*8)-1,sGLOBAL,0);
 
   add_constant("__Pawn",VERSION_INT,sGLOBAL,0);
@@ -1743,8 +1769,15 @@ static void dumplits(void)
     defstorage();
     j=16;       /* 16 values per line */
     while (j && k<litidx){
-      outval(litq[k], FALSE);
-      stgwrite(" ");
+      {
+        const char *num = itoh(litq[k]);
+        char buf[64];
+        int n = 0; int i;
+        for (i=0; num[i] != '\0' && n < (int)sizeof(buf)-2; i++) buf[n++] = num[i];
+        buf[n++] = ' ';
+        buf[n] = '\0';
+        stgwrite(buf);
+      }
       k++;
       j--;
       if (j==0 || k>=litidx)
@@ -1771,9 +1804,15 @@ static void dumpzero(int count)
   defstorage();
   i=0;
   while (count-- > 0) {
-    outval(0, FALSE);
+    {
+      const char *num = itoh(0);
+      char buf[4];
+      buf[0] = num[0];
+      buf[1] = (i==15 || count==0) ? '\n' : ' ';
+      buf[2] = '\0';
+      stgwrite(buf);
+    }
     i=(i+1) % 16;
-    stgwrite((i==0 || count==0) ? "\n" : " ");
     if (i==0 && count>0)
       defstorage();
   } /* while */
@@ -2638,6 +2677,7 @@ static cell needsub(int *tag,constvalue **enumroot)
 static void decl_const(int vclass)
 {
   char constname[sNAMEMAX+1];
+static int compare_constcase(const void *a,const void *b);
   cell val;
   char *str;
   int tag,exprtag;
@@ -3134,25 +3174,68 @@ static int check_operatortag(int opertok,int resulttag,char *opername)
 
 static char *tag2str(char *dest,int tag)
 {
+  static const char hexdigits[] = "0123456789abcdef";
+  unsigned int u;
+  int pos = 0;
+
   tag &= TAGMASK;
   assert(tag>=0);
-  sprintf(dest,"0%x",tag);
-  return isdigit(dest[1]) ? &dest[1] : dest;
+  u = (unsigned int)tag;
+
+  /* Build string as "0" + hex(tag) (no leading zeros in hex part). */
+  dest[pos++] = '0';
+  if (u == 0) {
+    dest[pos++] = '0';
+  } else {
+    int started = 0;
+    /* Iterate from highest nibble to lowest for 32-bit ints. */
+    for (int i = (int)(sizeof(unsigned int)*8 - 4); i >= 0; i -= 4) {
+      unsigned int nibble = (u >> i) & 0xFu;
+      if (!started) {
+        if (nibble == 0)
+          continue;
+        started = 1;
+      }
+      dest[pos++] = hexdigits[nibble];
+    }
+  }
+  dest[pos] = '\0';
+  return isdigit((unsigned char)dest[1]) ? &dest[1] : dest;
 }
 
 SC_FUNC char *operator_symname(char *symname,char *opername,int tag1,int tag2,int numtags,int resulttag)
 {
   char tagstr1[10], tagstr2[10];
+  const char *p1, *p2;
+  size_t len, olen;
   int opertok;
 
   assert(numtags>=1 && numtags<=2);
   opertok= (opername[1]=='\0') ? opername[0] : 0;
-  if (opertok=='=')
-    sprintf(symname,"%s%s%s",tag2str(tagstr1,resulttag),opername,tag2str(tagstr2,tag1));
-  else if (numtags==1 || opertok=='~')
-    sprintf(symname,"%s%s",opername,tag2str(tagstr1,tag1));
-  else
-    sprintf(symname,"%s%s%s",tag2str(tagstr1,tag1),opername,tag2str(tagstr2,tag2));
+
+  if (opertok=='=') {
+    p1 = tag2str(tagstr1,resulttag);
+    p2 = tag2str(tagstr2,tag1);
+    len = strlen(p1);
+    memcpy(symname, p1, len);
+    olen = strlen(opername);
+    memcpy(symname + len, opername, olen);
+    memcpy(symname + len + olen, p2, strlen(p2) + 1);
+  } else if (numtags==1 || opertok=='~') {
+    p1 = opername;
+    p2 = tag2str(tagstr1,tag1);
+    olen = strlen(p1);
+    memcpy(symname, p1, olen);
+    memcpy(symname + olen, p2, strlen(p2) + 1);
+  } else {
+    p1 = tag2str(tagstr1,tag1);
+    p2 = tag2str(tagstr2,tag2);
+    len = strlen(p1);
+    memcpy(symname, p1, len);
+    olen = strlen(opername);
+    memcpy(symname + len, opername, olen);
+    memcpy(symname + len + olen, p2, strlen(p2) + 1);
+  }
   return symname;
 }
 
@@ -3683,6 +3766,7 @@ static int declargs(symbol *sym)
             error(103);                 /* insufficient memory */
           memset(&sym->dim.arglist[argcnt+1],0,sizeof(arginfo));  /* keep the list terminated */
           sym->dim.arglist[argcnt]=arg;
+          /* (Removed) recording of defaults metadata to avoid first-pass overhead */
         } else {
           /* check the argument with the earlier definition */
           if (argcnt>oldargcnt || !argcompare(&sym->dim.arglist[argcnt],&arg))
@@ -3693,6 +3777,7 @@ static int declargs(symbol *sym)
           else if (arg.ident==iVARIABLE
                    && ((arg.hasdefault & uSIZEOF)!=0 || (arg.hasdefault & uTAGOF)!=0))
             free(arg.defvalue.size.symname);
+          /* (Removed) recording of defaults metadata to avoid first-pass overhead */
           free(arg.tags);
         } /* if */
         argcnt++;
@@ -5176,7 +5261,8 @@ static void doswitch(void)
   cell val;
   char *str;
   constvalue caselist = { NULL, "", 0, 0};   /* case list starts empty */
-  constvalue *cse,*csp;
+  constvalue *cse;
+  constvalue *case_tail = &caselist; /* append-only to avoid O(n^2) insertion */
   char labelname[sNAMEMAX+1];
 
   needtoken('(');
@@ -5215,26 +5301,8 @@ static void doswitch(void)
          */
 
         constexpr(&val,NULL,NULL);
-        /* Search the insertion point (the table is kept in sorted order, so
-         * that advanced abstract machines can sift the case table with a
-         * binary search). Check for duplicate case values at the same time.
-         */
-        for (csp=&caselist, cse=caselist.next;
-             cse!=NULL && cse->value<val;
-             csp=cse, cse=cse->next)
-          /* nothing */;
-        if (cse!=NULL && cse->value==val)
-          error(40,val);                /* duplicate "case" label */
-        /* Since the label is stored as a string in the "constvalue", the
-         * size of an identifier must be at least 8, as there are 8
-         * hexadecimal digits in a 32-bit number.
-         */
-        #if sNAMEMAX < 8
-          #error Length of identifier (sNAMEMAX) too small.
-        #endif
-        assert(csp!=NULL);
-        assert(csp->next==cse);
-        insert_constval(csp,cse,itoh(lbl_case),val,0);
+        /* Append unsorted; we'll sort once at the end for speed. */
+        case_tail = insert_constval(case_tail,NULL,itoh(lbl_case),val,0);
         if (matchtoken(tDBLDOT)) {
           cell end;
           constexpr(&end,NULL,NULL);
@@ -5242,16 +5310,7 @@ static void doswitch(void)
             error(50);                  /* invalid range */
           while (++val<=end) {
             casecount++;
-            /* find the new insertion point */
-            for (csp=&caselist, cse=caselist.next;
-                 cse!=NULL && cse->value<val;
-                 csp=cse, cse=cse->next)
-              /* nothing */;
-            if (cse!=NULL && cse->value==val)
-              error(40,val);            /* duplicate "case" label */
-            assert(csp!=NULL);
-            assert(csp->next==cse);
-            insert_constval(csp,cse,itoh(lbl_case),val,0);
+            case_tail = insert_constval(case_tail,NULL,itoh(lbl_case),val,0);
           } /* if */
         } /* if */
       } while (matchtoken(','));
@@ -5285,13 +5344,8 @@ static void doswitch(void)
     } /* switch */
   } while (tok!='}');
 
-  #if !defined NDEBUG
-    /* verify that the case table is sorted (unfortunatly, duplicates can
-     * occur; there really shouldn't be duplicate cases, but the compiler
-     * may not crash or drop into an assertion for a user error). */
-    for (cse=caselist.next; cse!=NULL && cse->next!=NULL; cse=cse->next)
-      assert(cse->value <= cse->next->value);
-  #endif
+  /* In the optimized path, cases are appended unsorted and sorted once before
+   * emitting the table, so the linked list need not be in ascending order. */
   /* generate the table here, before lbl_exit (general jump target) */
   setlabel(lbl_table);
   assert(swdefault==FALSE || swdefault==TRUE);
@@ -5303,12 +5357,38 @@ static void doswitch(void)
     strcpy(labelname,itoh(lbl_case));
   } /* if */
   ffcase(casecount,labelname,TRUE);
-  /* generate the rest of the table */
-  for (cse=caselist.next; cse!=NULL; cse=cse->next)
-    ffcase(cse->value,cse->name,FALSE);
+  /* Sort cases once and generate the table. */
+  if (casecount>0) {
+    constvalue **sorted = (constvalue**)malloc(casecount * sizeof(constvalue*));
+    if (sorted==NULL)
+      error(103);
+    int idx=0;
+    for (cse=caselist.next; cse!=NULL; cse=cse->next)
+      sorted[idx++]=cse;
+    assert(idx==casecount);
+    qsort(sorted, casecount, sizeof(constvalue*), compare_constcase);
+    for (idx=1; idx<casecount; idx++) {
+      if (sorted[idx-1]->value==sorted[idx]->value)
+        error(40,sorted[idx]->value);   /* duplicate case label */
+    }
+    for (idx=0; idx<casecount; idx++)
+      ffcase(sorted[idx]->value, sorted[idx]->name, FALSE);
+    free(sorted);
+  }
 
   setlabel(lbl_exit);
   delete_consttable(&caselist); /* clear list of case labels */
+}
+
+static int compare_constcase(const void *a,const void *b)
+{
+  const constvalue *lhs = *(const constvalue * const *)a;
+  const constvalue *rhs = *(const constvalue * const *)b;
+  if (lhs->value < rhs->value)
+    return -1;
+  if (lhs->value > rhs->value)
+    return 1;
+  return 0;
 }
 
 static void doassert(void)

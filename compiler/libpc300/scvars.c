@@ -99,6 +99,7 @@ SC_VDEFINE FILE *outf    = NULL;   /* (intermediate) text file written to */
 SC_VDEFINE jmp_buf errbuf;
 
 SC_VDEFINE HashTable *sp_Globals = NULL;
+SC_VDEFINE HashTable *sp_Locals = NULL;
 
 SC_VDEFINE char sLiteralQueueDisabled = FALSE;
 

@@ -31,6 +31,10 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
+#ifndef UINT32_MAX
+  typedef unsigned int uint32_t;
+#endif
 #if defined __BORLANDC__ && defined _Windows && !(defined __32BIT__ || defined __WIN32__)
   /* setjmp() and longjmp() not well supported in 16-bit windows */
   #include <windows.h>
@@ -122,7 +126,7 @@ typedef struct s_symbol {
   struct s_symbol *next;
   struct s_symbol *parent;  /* hierarchical types (multi-dimensional arrays) */
   char name[sNAMEMAX+1];
-  uint32_t hash;        /* value derived from name, for quicker searching */
+  unsigned int hash;        /* value derived from name, for quicker searching */
   cell addr;            /* address or offset (or value for constant, index for native function) */
   cell codeaddr;        /* address (in the code segment) where the symbol declaration starts */
   char vclass;          /* sLOCAL if "addr" refers to a local symbol */
@@ -662,7 +666,7 @@ SC_FUNC void jmp_eq0(int number);
 SC_FUNC void outval(cell val,int newline);
 
 /* function prototypes in SC5.C */
-SC_FUNC int error(int number,...) INVISIBLE;
+SC_FUNC int error(int number,...);
 SC_FUNC void errorset(int code, int line);
 
 /* function prototypes in SC6.C */
@@ -713,6 +717,9 @@ SC_FUNC stringlist *insert_dbgfile(const char *filename);
 SC_FUNC stringlist *insert_dbgline(int linenr);
 SC_FUNC stringlist *insert_dbgsymbol(symbol *sym);
 SC_FUNC char *get_dbgstring(int index);
+SC_FUNC int dbgstring_count(void);
+SC_FUNC char **dbgstring_snapshot(int *count);
+SC_FUNC void dbgstring_snapshot_free(char **arr);
 SC_FUNC void delete_dbgstringtable(void);
 
 /* function prototypes in SCMEMFILE.C */
@@ -756,6 +763,7 @@ SC_FUNC void state_conflict(symbol *root);
 #if !defined SC_SKIP_VDECL
 typedef struct HashTable HashTable;
 SC_VDECL struct HashTable *sp_Globals;
+SC_VDECL struct HashTable *sp_Locals;
 SC_VDECL symbol loctab;       /* local symbol table */
 SC_VDECL symbol glbtab;       /* global symbol table */
 SC_VDECL cell *litq;          /* the literal queue */

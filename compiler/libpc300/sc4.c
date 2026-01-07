@@ -1,22 +1,7 @@
 /*  Pawn compiler - code generation (unoptimized "assembler" code)
  *
- *  Copyright (c) ITB CompuPhase, 1997-2005
- *
- *  This software is provided "as-is", without any express or implied warranty.
- *  In no event will the authors be held liable for any damages arising from
- *  the use of this software.
- *
- *  Permission is granted to anyone to use this software for any purpose,
- *  including commercial applications, and to alter it and redistribute it
- *  freely, subject to the following restrictions:
- *
- *  1.  The origin of this software must not be misrepresented; you must not
- *      claim that you wrote the original software. If you use this software in
- *      a product, an acknowledgment in the product documentation would be
- *      appreciated but is not required.
- *  2.  Altered source versions must be plainly marked as such, and must not be
- *      misrepresented as being the original software.
- *  3.  This notice may not be removed or altered from any source distribution.
+ *  Original copyright (c) ITB CompuPhase, 1997-2005
+ *  See the source distribution for the full license text.
  */
 
 #include <assert.h>
@@ -46,8 +31,7 @@ SC_FUNC void writeleader(symbol *root)
   assert(code_idx==0);
 
   begcseg();
-  stgwrite(";program exit point\n");
-  stgwrite("\thalt 0\n");
+  stgwrite(";program exit point\n\thalt 0\n");
   code_idx+=opcodes(1)+opargs(1);       /* calculate code length */
 
   /* check whether there are any functions that have states */
@@ -73,12 +57,17 @@ SC_FUNC void writeleader(symbol *root)
   begdseg();
   for (fsa=sc_automaton_tab.next; fsa!=NULL; fsa=fsa->next) {
     defstorage();
-    stgwrite("0\t; automaton ");
-    if (strlen(fsa->name)==0)
-      stgwrite("(anonymous)");
-    else
-      stgwrite(fsa->name);
-    stgwrite("\n");
+    {
+      const char *nm = (strlen(fsa->name)==0) ? "(anonymous)" : fsa->name;
+      char line[sNAMEMAX + 32];
+      int ln = 0, i;
+      const char prefix[] = "0\t; automaton ";
+      for (i=0; prefix[i] != '\0'; i++) line[ln++] = prefix[i];
+      for (i=0; nm[i] != '\0' && ln < (int)sizeof(line)-2; i++) line[ln++] = nm[i];
+      line[ln++] = '\n';
+      line[ln] = '\0';
+      stgwrite(line);
+    }
     fsa->value=glb_declared*sizeof(cell);
     glb_declared++;
   } /* for */
@@ -133,9 +122,16 @@ SC_FUNC void writeleader(symbol *root)
       /* generate a stub entry for the functions */
       stgwrite("\tload.pri ");
       outval(fsa->value,FALSE);
-      stgwrite("\t; ");
-      stgwrite(sym->name);
-      stgwrite("\n");
+      {
+        char line[sNAMEMAX + 4];
+        int ln = 0, i;
+        const char *nm = sym->name ? sym->name : "";
+        line[ln++]='\t'; line[ln++]=';'; line[ln++]=' ';
+        for (i=0; nm[i] != '\0' && ln < (int)sizeof(line)-2; i++) line[ln++] = nm[i];
+        line[ln++]='\n';
+        line[ln]='\0';
+        stgwrite(line);
+      }
       code_idx+=opcodes(1)+opargs(1);   /* calculate code length */
       lbl_table=getlabel();
       ffswitch(lbl_table);
@@ -210,8 +206,7 @@ SC_FUNC void writetrailer(void)
 SC_FUNC void begcseg(void)
 {
   if (curseg!=sIN_CSEG) {
-    stgwrite("\n");
-    stgwrite("CODE\t; ");
+    stgwrite("\nCODE\t; ");
     outval(code_idx,TRUE);
     curseg=sIN_CSEG;
   } /* endif */
@@ -225,8 +220,7 @@ SC_FUNC void begcseg(void)
 SC_FUNC void begdseg(void)
 {
   if (curseg!=sIN_DSEG) {
-    stgwrite("\n");
-    stgwrite("DATA\t; ");
+    stgwrite("\nDATA\t; ");
     outval(glb_declared-litidx,TRUE);
     curseg=sIN_DSEG;
   } /* if */
@@ -239,8 +233,16 @@ SC_FUNC void setline(int chkbounds)
      * because earlier versions of Small/Pawn have an incompatible version of the
      * line opcode
      */
-    stgwrite("\tbreak\t; ");
-    outval(code_idx,TRUE);
+    {
+      const char *num = itoh(code_idx);
+      char line[64];
+      int n=0, i; const char prefix[]="\tbreak\t; ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+      if (n < (int)sizeof(line)-1) line[n++]='\n';
+      line[n]='\0';
+      stgwrite(line);
+    }
     code_idx+=opcodes(1);
   } /* if */
 }
@@ -271,16 +273,31 @@ SC_FUNC void setlinedirect(int line)
 SC_FUNC void setlabel(int number)
 {
   assert(number>=0);
-  stgwrite("l.");
-  stgwrite((char *)itoh(number));
+  {
+    const char *num = itoh(number);
+    char buf[64];
+    int n = 0, i;
+    buf[n++]='l'; buf[n++]='.';
+    for (i=0; num[i] != '\0' && n < (int)sizeof(buf)-1; i++) buf[n++] = num[i];
+    buf[n] = '\0';
+    stgwrite(buf);
+  }
   /* To assist verification of the assembled code, put the address of the
    * label as a comment. However, labels that occur inside an expression
    * may move (through optimization or through re-ordering). So write the
    * address only if it is known to accurate.
    */
   if (!staging) {
-    stgwrite("\t\t; ");
-    outval(code_idx,FALSE);
+    {
+      const char *num = itoh(code_idx);
+      char line[64];
+      int n=0, i;
+      const char prefix[]="\t\t; ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+      line[n] = '\0';
+      stgwrite(line);
+    }
   } /* if */
   stgwrite("\n");
 }
@@ -300,9 +317,16 @@ SC_FUNC void markexpr(optmark type,const char *name,cell offset)
     break;
   case sLDECL:
     assert(name!=NULL);
-    stgwrite("\t;$lcl ");
-    stgwrite(name);
-    stgwrite(" ");
+    {
+      char line[sNAMEMAX + 16];
+      int n=0, i;
+      const char prefix[]="\t;$lcl ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; name[i] != '\0' && n < (int)sizeof(line)-2; i++) line[n++] = name[i];
+      line[n++]=' ';
+      line[n]='\0';
+      stgwrite(line);
+    }
     outval(offset,TRUE);
     break;
   default:
@@ -320,8 +344,15 @@ SC_FUNC void startfunc(char *fname)
   if (sc_asmfile) {
     char symname[2*sNAMEMAX+16];
     funcdisplayname(symname,fname);
-    stgwrite("\t; ");
-    stgwrite(symname);
+    {
+      char line[2*sNAMEMAX + 8];
+      int n=0, i;
+      const char prefix[]="\t; ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; symname[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = symname[i];
+      line[n]='\0';
+      stgwrite(line);
+    }
   } /* if */
   stgwrite("\n");
   code_idx+=opcodes(1);
@@ -734,9 +765,15 @@ SC_FUNC void ffcase(cell value,char *labelname,int newtable)
   } /* if */
   stgwrite("\tcase ");
   outval(value,FALSE);
-  stgwrite(" ");
-  stgwrite(labelname);
-  stgwrite("\n");
+  {
+    char line[sNAMEMAX + 4];
+    int n=0, i;
+    line[n++]=' ';
+    for (i=0; labelname[i] != '\0' && n < (int)sizeof(line)-2; i++) line[n++] = labelname[i];
+    line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   code_idx+=opcodes(0)+opargs(2);
 }
 
@@ -759,11 +796,23 @@ SC_FUNC void ffcall(symbol *sym,const char *label,int numargs)
     stgwrite("\tsysreq.c ");
     outval(sym->addr,FALSE);
     if (sc_asmfile) {
-      stgwrite("\t; ");
-      stgwrite(symname);
+      char line[2*sNAMEMAX + 8];
+      int n=0, i; const char prefix[]="\t; ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; symname[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = symname[i];
+      line[n]='\0';
+      stgwrite(line);
     } /* if */
-    stgwrite("\n\tstack ");
-    outval((numargs+1)*sizeof(cell), TRUE);
+    {
+      const char *num = itoh((numargs+1)*sizeof(cell));
+      char line[48];
+      int n=0, i; const char prefix[]="\n\tstack ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+      if (n < (int)sizeof(line)-1) line[n++]='\n';
+      line[n]='\0';
+      stgwrite(line);
+    }
     code_idx+=opcodes(2)+opargs(2);
   } else {
     /* normal function */
@@ -797,16 +846,32 @@ SC_FUNC void ffret(void)
 
 SC_FUNC void ffabort(int reason)
 {
-  stgwrite("\thalt ");
-  outval(reason,TRUE);
+  {
+    const char *num = itoh(reason);
+    char line[40];
+    int n=0, i; const char prefix[]="\thalt ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   code_idx+=opcodes(1)+opargs(1);
 }
 
 SC_FUNC void ffbounds(cell size)
 {
   if ((sc_debug & sCHKBOUNDS)!=0) {
-    stgwrite("\tbounds ");
-    outval(size,TRUE);
+    {
+      const char *num = itoh(size);
+      char line[48];
+      int n=0, i; const char prefix[]="\tbounds ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+      if (n < (int)sizeof(line)-1) line[n++]='\n';
+      line[n]='\0';
+      stgwrite(line);
+    }
     code_idx+=opcodes(1)+opargs(1);
   } /* if */
 }
@@ -816,8 +881,16 @@ SC_FUNC void ffbounds(cell size)
  */
 SC_FUNC void jumplabel(int number)
 {
-  stgwrite("\tjump ");
-  outval(number,TRUE);
+  {
+    const char *num = itoh(number);
+    char line[40];
+    int n=0, i; const char prefix[]="\tjump ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   code_idx+=opcodes(1)+opargs(1);
 }
 
@@ -836,8 +909,14 @@ SC_FUNC void defstorage(void)
 SC_FUNC void modstk(int delta)
 {
   if (delta) {
-    stgwrite("\tstack ");
-    outval(delta, TRUE);
+    const char *num = itoh(delta);
+    char line[40];
+    int n=0, i; const char prefix[]="\tstack ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
     code_idx+=opcodes(1)+opargs(1);
   } /* if */
 }
@@ -848,8 +927,16 @@ SC_FUNC void setstk(cell value)
   stgwrite("\tlctrl 5\n");      /* get FRM in PRI */
   assert(value<=0);             /* STK should always become <= FRM */
   if (value<0) {
-    stgwrite("\tadd.c ");
-    outval(value, TRUE);        /* add (negative) offset */
+    {
+      const char *num = itoh(value);
+      char line[48];
+      int n=0, i; const char prefix[]="\tadd.c ";
+      for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+      for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+      if (n < (int)sizeof(line)-1) line[n++]='\n';
+      line[n]='\0';
+      stgwrite(line);
+    }
     code_idx+=opcodes(1)+opargs(1);
     // ??? write zeros in the space between STK and the value in PRI (the new stk)
     //     get value of STK in ALT
@@ -863,16 +950,30 @@ SC_FUNC void setstk(cell value)
 SC_FUNC void modheap(int delta)
 {
   if (delta) {
-    stgwrite("\theap ");
-    outval(delta, TRUE);
+    const char *num = itoh(delta);
+    char line[40];
+    int n=0, i; const char prefix[]="\theap ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
     code_idx+=opcodes(1)+opargs(1);
   } /* if */
 }
 
 SC_FUNC void setheap_pri(void)
 {
-  stgwrite("\theap ");          /* ALT = HEA++ */
-  outval(sizeof(cell), TRUE);
+  {
+    const char *num = itoh(sizeof(cell));
+    char line[40];
+    int n=0, i; const char prefix[]="\theap ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   stgwrite("\tstor.i\n");       /* store PRI (default value) at address ALT */
   stgwrite("\tmove.pri\n");     /* move ALT to PRI: PRI contains the address */
   code_idx+=opcodes(3)+opargs(1);
@@ -880,8 +981,16 @@ SC_FUNC void setheap_pri(void)
 
 SC_FUNC void setheap(cell value)
 {
-  stgwrite("\tconst.pri ");     /* load default value in PRI */
-  outval(value, TRUE);
+  {
+    const char *num = itoh(value);
+    char line[48];
+    int n=0, i; const char prefix[]="\tconst.pri ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   code_idx+=opcodes(1)+opargs(1);
   setheap_pri();
 }
@@ -961,8 +1070,16 @@ SC_FUNC void char2addr(void)
  */
 SC_FUNC void charalign(void)
 {
-  stgwrite("\talign.pri ");
-  outval(sCHARBITS/8,TRUE);
+  {
+    const char *num = itoh(sCHARBITS/8);
+    char line[32];
+    int n=0, i; const char prefix[]="\talign.pri ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
   code_idx+=opcodes(1)+opargs(1);
 }
 
@@ -972,8 +1089,14 @@ SC_FUNC void charalign(void)
 SC_FUNC void addconst(cell value)
 {
   if (value!=0) {
-    stgwrite("\tadd.c ");
-    outval(value,TRUE);
+    const char *num = itoh(value);
+    char line[64];
+    int n=0, i; const char prefix[]="\tadd.c ";
+    for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
     code_idx+=opcodes(1)+opargs(1);
   } /* if */
 }
@@ -1002,8 +1125,7 @@ SC_FUNC void os_div(void)
  */
 SC_FUNC void os_mod(void)
 {
-  stgwrite("\tsdiv.alt\n");
-  stgwrite("\tmove.pri\n");     /* move ALT to PRI */
+  stgwrite("\tsdiv.alt\n\tmove.pri\n");     /* move ALT to PRI */
   code_idx+=opcodes(2);
 }
 
@@ -1033,8 +1155,7 @@ SC_FUNC void ob_sub(void)
  */
 SC_FUNC void ob_sal(void)
 {
-  stgwrite("\txchg\n");
-  stgwrite("\tshl\n");
+  stgwrite("\txchg\n\tshl\n");
   code_idx+=opcodes(2);
 }
 
@@ -1044,8 +1165,7 @@ SC_FUNC void ob_sal(void)
  */
 SC_FUNC void os_sar(void)
 {
-  stgwrite("\txchg\n");
-  stgwrite("\tsshr\n");
+  stgwrite("\txchg\n\tsshr\n");
   code_idx+=opcodes(2);
 }
 
@@ -1055,8 +1175,7 @@ SC_FUNC void os_sar(void)
  */
 SC_FUNC void ou_sar(void)
 {
-  stgwrite("\txchg\n");
-  stgwrite("\tshr\n");
+  stgwrite("\txchg\n\tshr\n");
   code_idx+=opcodes(2);
 }
 
@@ -1127,16 +1246,13 @@ SC_FUNC void ob_ne(void)
  */
 SC_FUNC void relop_prefix(void)
 {
-  stgwrite("\tpush.pri\n");
-  stgwrite("\tmove.pri\n");
+  stgwrite("\tpush.pri\n\tmove.pri\n");
   code_idx+=opcodes(2);
 }
 
 SC_FUNC void relop_suffix(void)
 {
-  stgwrite("\tswap.alt\n");
-  stgwrite("\tand\n");
-  stgwrite("\tpop.alt\n");
+  stgwrite("\tswap.alt\n\tand\n\tpop.alt\n");
   code_idx+=opcodes(3);
 }
 
@@ -1230,16 +1346,13 @@ SC_FUNC void inc(value *lval)
     code_idx+=opcodes(1);
   } else if (lval->ident==iARRAYCHAR) {
     /* indirect increment of single character, address already in PRI */
-    stgwrite("\tpush.pri\n");
-    stgwrite("\tpush.alt\n");
-    stgwrite("\tmove.alt\n");   /* copy address */
+    stgwrite("\tpush.pri\n\tpush.alt\n\tmove.alt\n");   /* copy address */
     stgwrite("\tlodb.i ");      /* read from PRI into PRI */
     outval(sCHARBITS/8,TRUE);   /* read one or two bytes */
     stgwrite("\tinc.pri\n");
     stgwrite("\tstrb.i ");      /* write PRI to ALT */
     outval(sCHARBITS/8,TRUE);   /* write one or two bytes */
-    stgwrite("\tpop.alt\n");
-    stgwrite("\tpop.pri\n");
+    stgwrite("\tpop.alt\n\tpop.pri\n");
     code_idx+=opcodes(8)+opargs(2);
   } else if (lval->ident==iREFERENCE) {
     assert(sym!=NULL);
@@ -1288,16 +1401,13 @@ SC_FUNC void dec(value *lval)
     code_idx+=opcodes(1);
   } else if (lval->ident==iARRAYCHAR) {
     /* indirect decrement of single character, address already in PRI */
-    stgwrite("\tpush.pri\n");
-    stgwrite("\tpush.alt\n");
-    stgwrite("\tmove.alt\n");   /* copy address */
+    stgwrite("\tpush.pri\n\tpush.alt\n\tmove.alt\n");   /* copy address */
     stgwrite("\tlodb.i ");      /* read from PRI into PRI */
     outval(sCHARBITS/8,TRUE);   /* read one or two bytes */
     stgwrite("\tdec.pri\n");
     stgwrite("\tstrb.i ");      /* write PRI to ALT */
     outval(sCHARBITS/8,TRUE);   /* write one or two bytes */
-    stgwrite("\tpop.alt\n");
-    stgwrite("\tpop.pri\n");
+    stgwrite("\tpop.alt\n\tpop.pri\n");
     code_idx+=opcodes(8)+opargs(2);
   } else if (lval->ident==iREFERENCE) {
     assert(sym!=NULL);
@@ -1336,8 +1446,14 @@ SC_FUNC void dec(value *lval)
  */
 SC_FUNC void jmp_ne0(int number)
 {
-  stgwrite("\tjnz ");
-  outval(number,TRUE);
+  const char *num = itoh(number);
+  char line[48];
+  int n=0, i; const char prefix[]="\tjnz ";
+  for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+  for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+  if (n < (int)sizeof(line)-1) line[n++]='\n';
+  line[n]='\0';
+  stgwrite(line);
   code_idx+=opcodes(1)+opargs(1);
 }
 
@@ -1346,15 +1462,29 @@ SC_FUNC void jmp_ne0(int number)
  */
 SC_FUNC void jmp_eq0(int number)
 {
-  stgwrite("\tjzer ");
-  outval(number,TRUE);
+  const char *num = itoh(number);
+  char line[48];
+  int n=0, i; const char prefix[]="\tjzer ";
+  for (i=0; prefix[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = prefix[i];
+  for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+  if (n < (int)sizeof(line)-1) line[n++]='\n';
+  line[n]='\0';
+  stgwrite(line);
   code_idx+=opcodes(1)+opargs(1);
 }
 
 /* write a value in hexadecimal; optionally adds a newline */
 SC_FUNC void outval(cell val,int newline)
 {
-  stgwrite(itoh(val));
-  if (newline)
-    stgwrite("\n");
+  const char *num = itoh(val);
+  if (!newline) {
+    stgwrite(num);
+  } else {
+    char line[48];
+    int n=0, i;
+    for (i=0; num[i] != '\0' && n < (int)sizeof(line)-1; i++) line[n++] = num[i];
+    if (n < (int)sizeof(line)-1) line[n++]='\n';
+    line[n]='\0';
+    stgwrite(line);
+  }
 }

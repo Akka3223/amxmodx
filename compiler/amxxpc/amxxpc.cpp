@@ -120,15 +120,14 @@ int main(int argc, char **argv)
 			pc_printf("Could not locate output file %s (compile failed).\n", file);
 			exit(EXIT_FAILURE);
 		}
+		setvbuf(fp, NULL, _IOFBF, 1<<20);
 		ReadFileIntoPl(&pl32, fp);
 		pl32.cellsize = 4;
 		fclose(fp);
 	}
 
-	unlink(file);
-
 	/////////////
-	// COMPRSSION
+	// COMPRESSION
 	/////////////
 
 	CompressPl(&pl32);
@@ -144,6 +143,7 @@ int main(int argc, char **argv)
 		pc_printf("Error trying to write file %s.\n", newfile);
 		exit(EXIT_FAILURE);
 	}
+	setvbuf(fp, NULL, _IOFBF, 1<<20);
 
 	BinPlugin bh32;
 	
@@ -187,7 +187,7 @@ int main(int argc, char **argv)
 	unlink(file);
 	
 	/*
-	Without "Done" message "Compile and start Half-Life"
+	if (save > 0)
 	and "Compile and upload" buttons in AMXX-Studio doesn't work.
 	*/
 	pc_printf("Done.\n");
@@ -220,7 +220,11 @@ bool CompressPl(abl *pl)
 	pl->cmpsize = compressBound(pl->size);
 	pl->cmp = new char[pl->cmpsize];
 
+#if defined(_WIN32)
+	int err = compress2((Bytef *)(pl->cmp), (uLongf *)&(pl->cmpsize), (const Bytef *)(pl->data), pl->size, Z_BEST_SPEED);
+#else
 	int err = compress((Bytef *)(pl->cmp), (uLongf *)&(pl->cmpsize), (const Bytef *)(pl->data), pl->size);
+#endif
 
 	delete [] pl->data;
 	pl->data = NULL;
@@ -332,7 +336,7 @@ char *FindFileName(int argc, char **argv)
 		}
 	}
 
-	if (save>0)
+	if (save > 0)
 	{
 		return swiext(argv[save], "amx", 0);
 	}

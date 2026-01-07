@@ -207,6 +207,21 @@ AddToHashTable(HashTable *ht, symbol *sym)
 }
 
 SC_FUNC void
+AddToHashTableFront(HashTable *ht, symbol *sym)
+{
+        uint32_t bucket = sym->hash & ht->bucketmask;
+        HashEntry *he = (HashEntry *)malloc(sizeof(HashEntry));
+        if (!he)
+            error(163);
+        he->sym = sym;
+        he->next = ht->buckets[bucket];
+        ht->buckets[bucket] = he;
+        ht->nused++;
+
+        if (ht->nused > ht->nbuckets && ht->nbuckets <= INT_MAX / 2)
+                ResizeHashTable(ht);
+}
+SC_FUNC void
 RemoveFromHashTable(HashTable *ht, symbol *sym)
 {
     uint32_t bucket = sym->hash & ht->bucketmask;

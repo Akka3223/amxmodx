@@ -98,16 +98,30 @@ static void user_dec(void) {}
  */
 static int nextop(int *opidx,int *list)
 {
-  *opidx=0;
-  while (*list){
-    if (matchtoken(*list)){
-      sc_allowproccall=FALSE;
+  /* Fast-path: peek one token and compare against the list without
+   * repeatedly calling matchtoken()/lexpush(). This preserves behavior
+   * while avoiding extra lexer churn.
+   */
+  cell val;
+  char *str;
+  int tok;
+
+  tok = lex(&val, &str);
+
+  int idx = 0;
+  while (*list) {
+    if (tok == *list) {
+      sc_allowproccall = FALSE;
+      *opidx = idx;
       return TRUE;      /* found! */
-    } else {
-      list+=1;
-      *opidx+=1;
-    } /* if */
-  } /* while */
+    }
+    list += 1;
+    idx += 1;
+  }
+
+  /* Not found: push back the token to preserve stream state. */
+  lexpush();
+  *opidx = 0;
   return FALSE;         /* entire list scanned, nothing found */
 }
 
@@ -125,6 +139,18 @@ static void (*unopers[])(void) = { lneg, neg, user_inc, user_dec };
   int i,swapparams,savepri,savealt;
   int paramspassed;
   symbol *sym;
+
+  /* Simple last-result cache to avoid repeated operator symbol lookups.
+   * Keyed by (sc_status, numparam, opKey, tag1, tag2).
+   * Safe across a single pass; invalidated automatically by sc_status change.
+   */
+  static int cache_valid=FALSE;
+  static int cache_status=0;
+  static int cache_numparam=0;
+  static int cache_tag1=0, cache_tag2=0;
+  static int cache_opkey=0;
+  static int cache_swap=FALSE;
+  static symbol *cache_sym=NULL;
 
   /* since user-defined operators on untagged operands are forbidden, we have
    * a quick exit.
@@ -169,6 +195,34 @@ static void (*unopers[])(void) = { lneg, neg, user_inc, user_dec };
   if (opername[0]=='\0')
     return FALSE;
 
+  /* Compute operator key for caching. */
+  int opkey;
+  if (numparam==2) {
+    if (oper==NULL) {
+      opkey = -1; /* assignment */
+    } else {
+      opkey = -2; /* fallback if not found in table */
+      for (i=0; i<sizeof op1 / sizeof op1[0]; i++) {
+        if (oper==op1[i]) { opkey = i; break; }
+      }
+    }
+  } else {
+    opkey = 100; /* base for unary */
+    for (i=0; i<sizeof unopers / sizeof unopers[0]; i++) {
+      if (oper==unopers[i]) { opkey = 100 + i; break; }
+    }
+  }
+
+  /* Try cache hit. */
+  if (cache_valid && cache_status==sc_status && cache_numparam==numparam &&
+      cache_opkey==opkey && cache_tag1==tag1 && cache_tag2==tag2) {
+    sym = cache_sym;
+    swapparams = cache_swap;
+    if (sym==NULL)
+      return FALSE;
+    goto found_sym;
+  }
+
   /* create a symbol name from the tags and the operator name */
   assert(numparam==1 || numparam==2);
   operator_symname(symbolname,opername,tag1,tag2,numparam,tag2);
@@ -188,6 +242,18 @@ static void (*unopers[])(void) = { lneg, neg, user_inc, user_dec };
     if (sym==NULL /*|| (sym->usage & uDEFINE)==0*/)
       return FALSE;
   } /* if */
+
+  /* Update cache */
+  cache_valid = TRUE;
+  cache_status = sc_status;
+  cache_numparam = numparam;
+  cache_tag1 = tag1;
+  cache_tag2 = tag2;
+  cache_opkey = opkey;
+  cache_swap = swapparams;
+  cache_sym = sym;
+
+found_sym:
 
   /* check existance and the proper declaration of this function */
   if ((sym->usage & uMISSING)!=0 || (sym->usage & uPROTOTYPED)==0) {
@@ -546,6 +612,8 @@ static void plnge2(void (*oper)(void),
 {
   int index;
   cell cidx;
+  int is_addsub = (oper==ob_add || oper==ob_sub);
+  const int dblshift = (int)(sizeof(cell)/2);
 
   stgget(&index,&cidx);             /* mark position in code generator */
   if (lval1->ident==iCONSTEXPR) {   /* constant on left side; it is not yet loaded */
@@ -580,9 +648,9 @@ static void plnge2(void (*oper)(void),
       } /* if */
     } else {            /* non-constants on both sides */
       popreg(sALT);
-      if (dbltest(oper,lval1,lval2))
+      if (is_addsub && lval1->ident==iARRAY && lval2->ident!=iARRAY)
         cell2addr();                    /* double primary register */
-      if (dbltest(oper,lval2,lval1))
+      if (is_addsub && lval2->ident==iARRAY && lval1->ident!=iARRAY)
         cell2addr_alt();                /* double secondary register */
     } /* if */
   } /* if */
@@ -749,7 +817,7 @@ static int hier14(value *lval1)
    * negative value would do).
    */
   for (i=0; i<sDIMEN_MAX; i++)
-    arrayidx1[i]=arrayidx2[i]=(cell)(-1UL << (sizeof(cell)*8-1));
+    arrayidx1[i]=arrayidx2[i]=(cell)((~0UL) << (sizeof(cell)*8-1));
   org_arrayidx=lval1->arrayidx; /* save current pointer, to reset later */
   if (lval1->arrayidx==NULL)
     lval1->arrayidx=arrayidx1;
@@ -1258,8 +1326,7 @@ static int hier2(value *lval)
     return lvalue;
   case tDEFINED:
     paranthese=0;
-    while (matchtoken('('))
-      paranthese++;
+    for (;;) { cell tv; char *ts; int tk = lex(&tv,&ts); if (tk=='(') paranthese++; else { lexpush(); break; } }
     tok=lex(&val,&st);
     if (tok!=tSYMBOL)
       return error(20,st);      /* illegal symbol name */
@@ -1269,7 +1336,7 @@ static int hier2(value *lval)
     if (sym!=NULL && sym->ident!=iFUNCTN && sym->ident!=iREFFUNC && (sym->usage & uDEFINE)==0)
       sym=NULL;                 /* symbol is not a function, it is in the table, but not "defined" */
     val= (sym!=NULL);
-    if (!val && find_subst(st,strlen(st))!=NULL)
+    if (!val && find_subst(st,(int)strlen(st))!=NULL)
       val=1;
     clear_value(lval);
     lval->ident=iCONSTEXPR;
@@ -1281,8 +1348,7 @@ static int hier2(value *lval)
     return FALSE;
   case tSIZEOF:
     paranthese=0;
-    while (matchtoken('('))
-      paranthese++;
+    for (;;) { cell tv; char *ts; int tk = lex(&tv,&ts); if (tk=='(') paranthese++; else { lexpush(); break; } }
     tok=lex(&val,&st);
     if (tok!=tSYMBOL)
       return error(20,st);      /* illegal symbol name */
@@ -1303,7 +1369,9 @@ static int hier2(value *lval)
     if (sym->ident==iARRAY || sym->ident==iREFARRAY) {
       int level;
       symbol *idxsym=NULL;
-      for (level=0; matchtoken('['); level++) {
+      for (level=0;;) {
+        cell tv_; char *ts_; int tk_ = lex(&tv_, &ts_);
+        if (tk_!='[') { lexpush(); break; }
         idxsym=NULL;
         if (level==sym->dim.array.level && matchtoken(tSYMBOL)) {
           char *idxname;
@@ -1312,6 +1380,7 @@ static int hier2(value *lval)
             error(80,idxname);  /* unknown symbol, or non-constant */
         } /* if */
         needtoken(']');
+        level++;
       } /* for */
       if (level>sym->dim.array.level+1)
         error(28,sym->name);  /* invalid subscript */
@@ -1328,8 +1397,7 @@ static int hier2(value *lval)
     return FALSE;
   case tTAGOF:
     paranthese=0;
-    while (matchtoken('('))
-      paranthese++;
+    for (;;) { cell tv; char *ts; int tk = lex(&tv,&ts); if (tk=='(') paranthese++; else { lexpush(); break; } }
     tok=lex(&val,&st);
     if (tok!=tSYMBOL && tok!=tLABEL)
       return error(20,st);      /* illegal symbol name */
@@ -1349,7 +1417,9 @@ static int hier2(value *lval)
     if (sym!=NULL && (sym->ident==iARRAY || sym->ident==iREFARRAY)) {
       int level;
       symbol *idxsym=NULL;
-      for (level=0; matchtoken('['); level++) {
+      for (level=0;;) {
+        cell tv_; char *ts_; int tk_ = lex(&tv_, &ts_);
+        if (tk_!='[') { lexpush(); break; }
         idxsym=NULL;
         if (level==sym->dim.array.level && matchtoken(tSYMBOL)) {
           char *idxname;
@@ -1358,6 +1428,7 @@ static int hier2(value *lval)
             error(80,idxname);  /* unknown symbol, or non-constant */
         } /* if */
         needtoken(']');
+        level++;
       } /* for */
       if (level>sym->dim.array.level+1)
         error(28,sym->name);  /* invalid subscript */
@@ -1477,8 +1548,16 @@ static int hier1(value *lval1)
   cursym=lval1->sym;
 restart:
   sym=cursym;
-  if (matchtoken('[') || matchtoken('{') || matchtoken('(')) {
-    tok=tokeninfo(&val,&st);    /* get token read by matchtoken() */
+  {
+    cell tval; char *tstr; int ntok = lex(&tval,&tstr);
+    if (ntok=='[' || ntok=='{' || ntok=='(') {
+      tok = ntok;  /* token already consumed */
+    } else {
+      lexpush();
+      goto no_bracket;
+    }
+  }
+  if (1) { /* entered with one of '[', '{', '(' */
     if (sym==NULL && symtok!=tSYMBOL) {
       /* we do not have a valid symbol and we appear not to have read a valid
        * symbol name (so it is unlikely that we would have read a name of an
@@ -1491,15 +1570,24 @@ restart:
       close = (char)((tok=='[') ? ']' : '}');
       if (sym==NULL) {  /* sym==NULL if lval is a constant or a literal */
         error(28,"<no variable>");  /* cannot subscript */
-        needtoken(close);
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok!=close) { lexpush(); needtoken(close); }
+        }
         return FALSE;
       } else if (sym->ident!=iARRAY && sym->ident!=iREFARRAY){
         error(28,sym->name);    /* cannot subscript, variable is not an array */
-        needtoken(close);
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok!=close) { lexpush(); needtoken(close); }
+        }
         return FALSE;
       } else if (sym->dim.array.level>0 && close!=']') {
         error(51);      /* invalid subscript, must use [ ] */
-        needtoken(close);
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok!=close) { lexpush(); needtoken(close); }
+        }
         return FALSE;
       } /* if */
       stgget(&index,&cidx);     /* mark position in code generator */
@@ -1508,7 +1596,10 @@ restart:
         rvalue(&lval2);
       if (lval2.ident==iARRAY || lval2.ident==iREFARRAY)
         error(33,lval2.sym->name);      /* array must be indexed */
-      needtoken(close);
+      {
+        cell tval; char *tstr; int tok = lex(&tval,&tstr);
+        if (tok!=close) { lexpush(); needtoken(close); }
+      }
       if (!matchtag(sym->x.idxtag,lval2.tag,TRUE))
         error(213);
       if (lval2.ident==iCONSTEXPR) {    /* constant expression */
@@ -1660,6 +1751,7 @@ restart:
       return FALSE;             /* result of function call is no lvalue */
     } /* if */
   } /* if */
+no_bracket:
   if (sym!=NULL && lval1->ident==iFUNCTN) {
     assert(sym->ident==iFUNCTN);
     if (sc_allowproccall) {
@@ -1700,9 +1792,18 @@ static int primary(value *lval)
     sc_intest=FALSE;            /* no longer in "test" expression */
     sc_allowtags=TRUE;          /* allow tagnames to be used in parenthesized expressions */
     sc_allowproccall=FALSE;
-    do
+    do {
       lvalue=hier14(lval);
-    while (matchtoken(','));
+      {
+        cell tval; char *tstr; int tok = lex(&tval,&tstr);
+        if (tok==',') {
+          /* continue parsing next expression */
+        } else {
+          lexpush();
+          break;
+        }
+      }
+    } while (1);
     needtoken(')');
     lexclr(FALSE);              /* clear lex() push-back, it should have been
                                  * cleared already by needtoken() */
@@ -1839,11 +1940,75 @@ static void setdefarray(cell *string,cell size,cell array_sz,cell *dataaddr,int 
 static int findnamedarg(arginfo *arg,char *name)
 {
   int i;
-
-  for (i=0; arg[i].ident!=0 && arg[i].ident!=iVARARGS; i++)
-    if (strcmp(arg[i].name,name)==0)
+  size_t nlen = strlen(name);
+  for (i=0; arg[i].ident!=0 && arg[i].ident!=iVARARGS; i++) {
+    const char *an = arg[i].name;
+    if (an[0] != name[0])
+      continue;
+    if (strlen(an) != nlen)
+      continue;
+    if (strcmp(an,name)==0)
       return i;
+  }
   return -1;
+}
+
+/* Per-function cache for named-parameter indices to avoid repeated scans. */
+typedef struct ArgIndexEntry { const char *name; short index; short namelen; } ArgIndexEntry;
+typedef struct ArgIndexCache {
+  symbol *sym;
+  int count;
+  ArgIndexEntry entries[sMAXARGS];
+} ArgIndexCache;
+static ArgIndexCache s_argIndexCaches[128];
+static int s_argIndexCacheCount = 0;
+
+static int findnamedarg_cached(symbol *sym, arginfo *arg, char *name)
+{
+  int i;
+  size_t nlen = strlen(name);
+  ArgIndexCache *cache = NULL;
+  for (i = 0; i < s_argIndexCacheCount; i++) {
+    if (s_argIndexCaches[i].sym == sym) { cache = &s_argIndexCaches[i]; break; }
+  }
+  if (cache == NULL) {
+    if (s_argIndexCacheCount < (int)(sizeof(s_argIndexCaches)/sizeof(s_argIndexCaches[0]))) {
+      cache = &s_argIndexCaches[s_argIndexCacheCount++];
+      cache->sym = sym;
+      cache->count = 0;
+      for (i=0; arg[i].ident!=0 && arg[i].ident!=iVARARGS; i++) {
+        cache->entries[cache->count].name = arg[i].name;
+        cache->entries[cache->count].index = (short)i;
+        cache->entries[cache->count].namelen = (short)strlen(arg[i].name);
+        cache->count++;
+      }
+    }
+  }
+  if (cache) {
+    for (i = 0; i < cache->count; i++) {
+      const char *an = cache->entries[i].name;
+      if (an[0] != name[0])
+        continue;
+      if ((size_t)cache->entries[i].namelen != nlen)
+        continue;
+      if (strcmp(an,name)==0)
+        return cache->entries[i].index;
+    }
+  }
+  /* fallback */
+  return findnamedarg(arg, name);
+}
+
+/* Utility: check if a name exists in a list of names. */
+static int name_in_list(const char **list, int count, const char *name)
+{
+  int i;
+  for (i=0; i<count; i++) {
+    const char *n = list[i];
+    if (n && n[0]==name[0] && strcmp(n, name)==0)
+      return 1;
+  }
+  return 0;
 }
 
 static int checktag(int tags[],int numtags,int exprtag)
@@ -1852,6 +2017,9 @@ static int checktag(int tags[],int numtags,int exprtag)
 
   assert(tags!=0);
   assert(numtags>0);
+  /* Fast path: single tag is common */
+  if (numtags==1)
+    return matchtag(tags[0],exprtag,TRUE);
   for (i=0; i<numtags; i++)
     if (matchtag(tags[i],exprtag,TRUE))
       return TRUE;    /* matching tag */
@@ -1869,6 +2037,45 @@ enum {
  *  Generates code to call a function. This routine handles default arguments
  *  and positional as well as named parameters.
  */
+typedef struct ConstMapEntry {
+  const char *name;
+  short index;
+  constvalue *entry;
+  int namelen;
+} ConstMapEntry;
+
+static inline constvalue *map_find(ConstMapEntry *map, int count, const char *name, short index)
+{
+  int i;
+  size_t nlen = name ? strlen(name) : 0;
+  for (i = 0; i < count; i++) {
+    ConstMapEntry *e = &map[i];
+    if (e->index != index)
+      continue;
+    const char *en = e->name;
+    if (!en || !name)
+      continue;
+    if (en[0] != name[0])
+      continue;
+    if ((size_t)e->namelen != nlen)
+      continue;
+    if (strcmp(en, name) == 0)
+      return e->entry;
+  }
+  return NULL;
+}
+
+static inline void map_add(ConstMapEntry *map, int *count, int capacity, const char *name, short index, constvalue *entry)
+{
+  if (*count >= capacity || !entry)
+    return;
+  map[*count].name = name;
+  map[*count].index = index;
+  map[*count].entry = entry;
+  map[*count].namelen = (int)(name ? strlen(name) : 0);
+  (*count)++;
+}
+
 static void callfunction(symbol *sym,value *lval_result,int matchparanthesis)
 {
 static long nest_stkusage=0L;
@@ -1882,9 +2089,16 @@ static int nesting=0;
   int namedparams=FALSE;
   value lval = {0};
   arginfo *arg;
+  /* Build arraysz/tag lists only if any defaults depend on them; collect referenced names per call. */
+  int need_arraysz = FALSE, need_taglist = FALSE;
+  const char *arraysz_needed_names[sMAXARGS]; int arraysz_needed_count = 0;
+  const char *tag_needed_names[sMAXARGS]; int tag_needed_count = 0;
   char arglist[sMAXARGS];
   constvalue arrayszlst = { NULL, "", 0, 0}; /* array size list starts empty */
   constvalue taglst = { NULL, "", 0, 0};    /* tag list starts empty */
+  /* lightweight per-call maps to avoid repeated scans in find_constval */
+  ConstMapEntry arraysz_map[64]; int arraysz_count = 0;
+  ConstMapEntry tag_map[64]; int tag_count = 0;
   symbol *symret;
   cell lexval;
   char *lexstr;
@@ -1927,13 +2141,68 @@ static int nesting=0;
   /* run through the arguments */
   arg=sym->dim.arglist;
   assert(arg!=NULL);
+  /* Zero-parameter fast path: if the function declares no parameters, and
+   * the syntax confirms an empty call site, skip argument parsing and jump
+   * straight to the call emission, sharing the common tail.
+   */
+  if (arg[0].ident==0) {
+    int empty_call = 0;
+    if (matchparanthesis) {
+      cell tval; char *tstr; int tok = lex(&tval,&tstr);
+      if (tok==')')
+        empty_call = 1;
+      else
+        lexpush();
+    } else {
+      if (matchtoken(tTERM)) { /* procedure-style call at end of statement */
+        lexpush();
+        empty_call = 1;
+      }
+    }
+    if (empty_call) {
+      stgmark(sSTARTREORDER);
+      goto emit_call;
+    }
+  }
+  {
+    int pre_idx;
+    for (pre_idx = 0; arg[pre_idx].ident!=0 && arg[pre_idx].ident!=iVARARGS; pre_idx++) {
+      if ((arg[pre_idx].hasdefault & uSIZEOF)!=0)
+        need_arraysz = TRUE;
+      if ((arg[pre_idx].hasdefault & uTAGOF)!=0)
+        need_taglist = TRUE;
+      if ((arg[pre_idx].hasdefault & uSIZEOF)!=0) {
+        const char *nm = arg[pre_idx].defvalue.size.symname;
+        int k, found = 0;
+        for (k=0; k<arraysz_needed_count; k++) if (strcmp(arraysz_needed_names[k], nm)==0) { found=1; break; }
+        if (!found && arraysz_needed_count < sMAXARGS)
+          arraysz_needed_names[arraysz_needed_count++] = nm;
+      }
+      if ((arg[pre_idx].hasdefault & uTAGOF)!=0) {
+        const char *nm = arg[pre_idx].defvalue.size.symname;
+        int k, found = 0;
+        for (k=0; k<tag_needed_count; k++) if (strcmp(tag_needed_names[k], nm)==0) { found=1; break; }
+        if (!found && tag_needed_count < sMAXARGS)
+          tag_needed_names[tag_needed_count++] = nm;
+      }
+    }
+  }
+  #define IS_ARRAYSZ_NEEDED(nm) (need_arraysz && name_in_list(arraysz_needed_names, arraysz_needed_count, (nm)))
+  #define IS_TAG_NEEDED(nm)     (need_taglist && name_in_list(tag_needed_names, tag_needed_count, (nm)))
+  /* Note: need_arraysz/taglist already computed; names checked via symbol lists. */
+
   stgmark(sSTARTREORDER);
   memset(arglist,ARG_UNHANDLED,sizeof arglist);
   if (matchparanthesis) {
     /* Opening brace was already parsed, if closing brace follows, this
      * call passes no parameters.
      */
-    close=matchtoken(')');
+    {
+      cell tval; char *tstr; int tok = lex(&tval,&tstr);
+      if (tok==')')
+        close = 1;
+      else { lexpush(); close = 0; }
+    }
   } else {
     /* When we find an end of line here, it may be a function call passing
      * no parameters, or it may be that the first parameter is on a line
@@ -1951,11 +2220,21 @@ static int nesting=0;
     do {
       if (matchtoken('.')) {
         namedparams=TRUE;
-        if (needtoken(tSYMBOL))
-          tokeninfo(&lexval,&lexstr);
-        else
-          lexstr="";
-        argpos=findnamedarg(arg,lexstr);
+        /* Fast path: read the symbol directly; fall back to needtoken() for errors. */
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok==tSYMBOL) {
+            lexval = tval;
+            lexstr = tstr;
+          } else {
+            lexpush();
+            if (needtoken(tSYMBOL))
+              tokeninfo(&lexval,&lexstr);
+            else
+              lexstr="";
+          }
+        }
+        argpos=findnamedarg_cached(sym,arg,lexstr);
         if (argpos<0) {
           error(17,lexstr);       /* undefined symbol */
           break;                  /* exit loop, argpos is invalid */
@@ -2034,8 +2313,10 @@ static int nesting=0;
             markusage(lval.sym,uWRITTEN);
           if (!checktag(arg[argidx].tags,arg[argidx].numtags,lval.tag))
             error(213);
-          if (lval.tag != 0)
-            append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+          if (lval.tag != 0 && IS_TAG_NEEDED(arg[argidx].name)) {
+            constvalue *cv = append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+            map_add(tag_map, &tag_count, (int)(sizeof(tag_map)/sizeof(tag_map[0])), arg[argidx].name, 0, cv);
+          }
           break;
         case iVARIABLE:
           if (lval.ident==iLABEL || lval.ident==iFUNCTN || lval.ident==iREFFUNC
@@ -2048,8 +2329,10 @@ static int nesting=0;
           check_userop(NULL,lval.tag,arg[argidx].tags[0],2,NULL,&lval.tag);
           if (!checktag(arg[argidx].tags,arg[argidx].numtags,lval.tag))
             error(213);
-          if (lval.tag != 0)
-            append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+          if (lval.tag != 0 && IS_TAG_NEEDED(arg[argidx].name)) {
+            constvalue *cv = append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+            map_add(tag_map, &tag_count, (int)(sizeof(tag_map)/sizeof(tag_map[0])), arg[argidx].name, 0, cv);
+          }
           argidx++;               /* argument done */
           break;
         case iREFERENCE:
@@ -2070,8 +2353,10 @@ static int nesting=0;
           /* otherwise, the address is already in PRI */
           if (!checktag(arg[argidx].tags,arg[argidx].numtags,lval.tag))
             error(213);
-          if (lval.tag != 0)
-            append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+          if (lval.tag != 0) {
+            constvalue *cv = append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+            map_add(tag_map, &tag_count, (int)(sizeof(tag_map)/sizeof(tag_map[0])), arg[argidx].name, 0, cv);
+          }
           argidx++;               /* argument done */
           if (lval.sym!=NULL)
             markusage(lval.sym,uWRITTEN);
@@ -2115,7 +2400,10 @@ static int nesting=0;
               assert(array_sz!=0);/* literal array must have a size */
               if (array_sz<0)
                 array_sz= -array_sz;
-              append_constval(&arrayszlst,arg[argidx].name,array_sz,0);
+              if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+                constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,array_sz,0);
+                map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, 0, cv);
+              }
             } /* if */
           } else {
             symbol *sym=lval.sym;
@@ -2126,13 +2414,16 @@ static int nesting=0;
             /* the lengths for all dimensions must match, unless the dimension
              * length was defined at zero (which means "undefined")
              */
-            while (sym->dim.array.level>0) {
+              while (sym->dim.array.level>0) {
               assert(level<sDIMEN_MAX);
               if (arg[argidx].dim[level]!=0 && sym->dim.array.length!=arg[argidx].dim[level])
                 error(47);        /* array sizes must match */
               else if (!matchtag(arg[argidx].idxtag[level],sym->x.idxtag,TRUE))
                 error(229,sym->name);   /* index tag mismatch */
-              append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
+                if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+                  constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
+                  map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, level, cv);
+                }
               sym=finddepend(sym);
               assert(sym!=NULL);
               level++;
@@ -2144,13 +2435,18 @@ static int nesting=0;
               error(47);          /* array sizes must match */
             else if (!matchtag(arg[argidx].idxtag[level],sym->x.idxtag,TRUE))
               error(229,sym->name);   /* index tag mismatch */
-            append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
+            if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+              constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
+              map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, level, cv);
+            }
           } /* if */
           /* address already in PRI */
           if (!checktag(arg[argidx].tags,arg[argidx].numtags,lval.tag))
             error(213);
-          if (lval.tag != 0)
-            append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+          if (lval.tag != 0 && IS_TAG_NEEDED(arg[argidx].name)) {
+            constvalue *cv = append_constval(&taglst, arg[argidx].name, lval.tag, 0);
+            map_add(tag_map, &tag_count, (int)(sizeof(tag_map)/sizeof(tag_map[0])), arg[argidx].name, 0, cv);
+          }
           // ??? set uWRITTEN?
           argidx++;               /* argument done */
           break;
@@ -2162,16 +2458,36 @@ static int nesting=0;
       assert(arglist[argpos]!=ARG_UNHANDLED);
       nargs++;
       if (matchparanthesis) {
-        close=matchtoken(')');
-        if (!close)               /* if not paranthese... */
-          if (!needtoken(','))    /* ...should be comma... */
-            break;                /* ...but abort loop if neither */
+        /* Fast path: single lex() to decide on ')' vs ',' without
+         * extra matchtoken() calls. Fallback to needtoken(',') on other tokens.
+         */
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok==')') {
+            close = 1;
+          } else if (tok==',') {
+            close = 0;
+          } else {
+            lexpush();
+            if (!needtoken(','))
+              break;
+          }
+        }
       } else {
-        close=!matchtoken(',');
-        if (close) {              /* if not comma... */
-          if (needtoken(tTERM)==1)/* ...must be end of statement */
-            lexpush();            /* push again, because end of statement is analised later */
-        } /* if */
+        /* Fast path for non-parenthesis delimiter: consume ',' directly. */
+        {
+          cell tval; char *tstr; int tok = lex(&tval,&tstr);
+          if (tok==',') {
+            close = 0;
+          } else {
+            lexpush();
+            close=!matchtoken(',');
+            if (close) {              /* if not comma... */
+              if (needtoken(tTERM)==1)/* ...must be end of statement */
+                lexpush();            /* push again, because end of statement is analised later */
+            } /* if */
+          }
+        }
       } /* if */
     } while (!close && freading && !matchtoken(tENDEXPR)); /* do */
   } /* if */
@@ -2203,11 +2519,17 @@ static int nesting=0;
           /* keep the lengths of all dimensions of a multi-dimensional default array */
           assert(arg[argidx].numdim>0);
           if (arg[argidx].numdim==1) {
-            append_constval(&arrayszlst,arg[argidx].name,arg[argidx].defvalue.array.arraysize,0);
+            if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+              constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,arg[argidx].defvalue.array.arraysize,0);
+              map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, 0, cv);
+            }
           } else {
             for (level=0; level<arg[argidx].numdim; level++) {
               assert(level<sDIMEN_MAX);
-              append_constval(&arrayszlst,arg[argidx].name,arg[argidx].dim[level],level);
+              if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+                constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,arg[argidx].dim[level],level);
+                map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, level, cv);
+              }
             } /* for */
           } /* if */
         }
@@ -2236,7 +2558,8 @@ static int nesting=0;
   /* now a second loop to catch the arguments with default values that are
    * the "sizeof" or "tagof" of other arguments
    */
-  for (argidx=0; arg[argidx].ident!=0 && arg[argidx].ident!=iVARARGS; argidx++) {
+  if (need_arraysz || need_taglist) {
+    for (argidx=0; arg[argidx].ident!=0 && arg[argidx].ident!=iVARARGS; argidx++) {
     constvalue *asz;
     cell array_sz;
     if (arglist[argidx]==ARG_DONE)
@@ -2250,8 +2573,15 @@ static int nesting=0;
        * was a "sizeof" of a non-array (a warning for this was already given
        * when declaring the function)
        */
-      asz=find_constval(&arrayszlst,arg[argidx].defvalue.size.symname,
-                        arg[argidx].defvalue.size.level);
+        asz = NULL;
+        if (need_arraysz) {
+          asz=map_find(arraysz_map, arraysz_count, arg[argidx].defvalue.size.symname,
+                       arg[argidx].defvalue.size.level);
+          if (asz==NULL) {
+            asz=find_constval(&arrayszlst,arg[argidx].defvalue.size.symname,
+                              arg[argidx].defvalue.size.level);
+          }
+        }
       if (asz!=NULL) {
         array_sz=asz->value;
         if (array_sz==0)
@@ -2260,8 +2590,15 @@ static int nesting=0;
         array_sz=1;
       } /* if */
     } else {
-      asz=find_constval(&taglst,arg[argidx].defvalue.size.symname,
-                        arg[argidx].defvalue.size.level);
+        asz = NULL;
+        if (need_taglist) {
+          asz=map_find(tag_map, tag_count, arg[argidx].defvalue.size.symname,
+                       arg[argidx].defvalue.size.level);
+          if (asz==NULL) {
+            asz=find_constval(&taglst,arg[argidx].defvalue.size.symname,
+                              arg[argidx].defvalue.size.level);
+          }
+        }
       if (asz != NULL) {
         exporttag(asz->value);
         array_sz=asz->value | PUBLICTAG;  /* must be set, because it just was exported */
@@ -2276,7 +2613,9 @@ static int nesting=0;
     if (arglist[argidx]==ARG_UNHANDLED)
       nargs++;
     arglist[argidx]=ARG_DONE;
-  } /* for */
+    } /* for */
+  } /* if (need_arraysz || need_taglist) */
+emit_call:
   stgmark(sENDREORDER);         /* mark end of reversed evaluation */
   pushval((cell)nargs*sizeof(cell));
   nest_stkusage++;
@@ -2427,7 +2766,16 @@ static int constant(value *lval)
       else if (!matchtag(lasttag,tag,FALSE))
         error(213);             /* tagname mismatch */
       litadd(item);             /* store expression result in literal table */
-    } while (matchtoken(','));
+      {
+        cell tval; char *tstr; int tk = lex(&tval,&tstr);
+        if (tk==',') {
+          /* continue */
+        } else {
+          lexpush();
+          break;
+        }
+      }
+    } while (1);
     if (!needtoken('}'))
       lexclr(FALSE);
     ldconst((val+glb_declared)*sizeof(cell),sPRI);

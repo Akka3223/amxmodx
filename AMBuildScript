@@ -263,6 +263,14 @@ class AMXXConfig(object):
 
     if builder.options.opt == '1':
       cxx.cflags += ['-O2']
+      # Enable section splitting for better dead code folding.
+      cxx.cflags += ['-ffunction-sections', '-fdata-sections']
+      cxx.linkflags += ['-Wl,--gc-sections']
+      # Enable LTO by default unless disabled.
+      if not getattr(builder.options, 'disable_lto', False):
+        cxx.cflags += ['-flto']
+        cxx.cxxflags += ['-flto']
+        cxx.linkflags += ['-flto']
 
   def configure_msvc(self, cxx):
     if builder.options.debug == '1':
@@ -279,6 +287,7 @@ class AMXXConfig(object):
     ]
     cxx.cflags += [
       '/W3',
+      '/MP',
     ]
     cxx.cxxflags += [
       '/EHsc',
@@ -306,8 +315,13 @@ class AMXXConfig(object):
       cxx.linkflags += ['legacy_stdio_definitions.lib', 'legacy_stdio_wide_specifiers.lib']
 
     if builder.options.opt == '1':
-      cxx.cflags += ['/Ox']
+      # Use /O2 for predictable aggressive optimization; keep legacy /Ox behavior.
+      cxx.cflags += ['/Ox', '/Oi', '/Gw', '/GF']
       cxx.linkflags += ['/OPT:ICF', '/OPT:REF']
+      # Enable LTCG by default unless disabled.
+      if not getattr(builder.options, 'disable_lto', False):
+        cxx.cflags += ['/GL']
+        cxx.linkflags += ['/LTCG']
 
     if builder.options.debug == '1':
       cxx.cflags += ['/Od', '/RTC1']

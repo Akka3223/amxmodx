@@ -66,6 +66,10 @@ static void stgopt(char *start,char *end);
 
 static char *stgbuf = NULL;
 static int stgmax = 0;  /* current size of the staging buffer */
+/* Track current length of the non-staging output buffer to avoid
+ * repeated strlen() calls and quadratic concatenation cost.
+ */
+static int outbuf_len = 0;
 
 #define CHECK_STGBUFFER(index) if ((int)(index)>=stgmax) grow_stgbuffer((index)+1)
 
@@ -153,7 +157,7 @@ static int filewrite(char *str)
  */
 SC_FUNC void stgwrite(const char *st)
 {
-  int len;
+  size_t slen;
 
   CHECK_STGBUFFER(0);
   if (staging) {
@@ -166,14 +170,17 @@ SC_FUNC void stgwrite(const char *st)
     CHECK_STGBUFFER(stgidx);
     stgbuf[stgidx++]='\0';
   } else {
-    CHECK_STGBUFFER(strlen(stgbuf)+strlen(st)+1);
-    strcat(stgbuf,st);
-    len=strlen(stgbuf);
-    if (len>0 && stgbuf[len-1]=='\n') {
+    slen = strlen(st);
+    CHECK_STGBUFFER(outbuf_len + (int)slen + 1);
+    memcpy(stgbuf + outbuf_len, st, slen);
+    outbuf_len += (int)slen;
+    stgbuf[outbuf_len] = '\0';
+    if (outbuf_len > 0 && stgbuf[outbuf_len - 1] == '\n') {
       filewrite(stgbuf);
-      stgbuf[0]='\0';
-    } /* if */
-  } /* if */
+      outbuf_len = 0;
+      stgbuf[0] = '\0';
+    }
+  }
 }
 
 /*  stgout
@@ -323,8 +330,10 @@ SC_FUNC void stgset(int onoff)
     /* write any contents that may be put in the buffer by stgwrite()
      * when "staging" was 0
      */
-    if (strlen(stgbuf)>0)
+    if (outbuf_len > 0) {
       filewrite(stgbuf);
+      outbuf_len = 0;
+    }
   } /* if */
   stgbuf[0]='\0';
 }
@@ -354,6 +363,9 @@ SC_FUNC int phopt_cleanup(void)
   #define MAX_ALIAS       (PAWN_CELL_SIZE/4) * MAX_OPT_CAT
 #endif
 
+/* Branchless lowercase helper to avoid locale-dependent tolower() calls. */
+#define LOWER_CHAR(c) ( ((c)>='A' && (c)<='Z') ? (char)((c) + ('a' - 'A')) : (c) )
+
 static int matchsequence(const char *start,const char *end,const char *pattern,
                          char symbols[MAX_OPT_VARS][MAX_ALIAS+1],
                          int *match_length)
@@ -377,7 +389,7 @@ static int matchsequence(const char *start,const char *end,const char *pattern,
     case '%':   /* new "symbol" */
       pattern++;
       assert(isdigit(*pattern));
-      var=atoi(pattern) - 1;
+      var = (*pattern - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
       assert(*start=='-' || alphanum(*start));
       for (i=0; start<end && (*start=='-' || *start=='+' || alphanum(*start)); i++,start++) {
@@ -396,7 +408,7 @@ static int matchsequence(const char *start,const char *end,const char *pattern,
       value=-strtol(pattern+1,(char **)&pattern,16);
       ptr=itoh((ucell)value);
       while (*ptr!='\0') {
-        if (tolower(*start) != tolower(*ptr))
+        if (LOWER_CHAR(*start) != LOWER_CHAR(*ptr))
           return FALSE;
         start++;
         ptr++;
@@ -421,7 +433,7 @@ static int matchsequence(const char *start,const char *end,const char *pattern,
           start++;              /* skip leading white space of next instruction */
       break;
     default:
-      if (tolower(*start) != tolower(*pattern))
+      if (LOWER_CHAR(*start) != LOWER_CHAR(*pattern))
         return FALSE;
       start++;
     } /* switch */
@@ -451,7 +463,7 @@ static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_
     case '%':
       lptr++;           /* skip '%' */
       assert(isdigit(*lptr));
-      var=atoi(lptr) - 1;
+      var = (*lptr - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
       assert(symbols[var][0]!='\0');    /* variable should be defined */
       *repl_length+=strlen(symbols[var]);
@@ -479,7 +491,7 @@ static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_
       /* write out the symbol */
       pattern++;
       assert(isdigit(*pattern));
-      var=atoi(pattern) - 1;
+      var = (*pattern - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
       assert(symbols[var][0]!='\0');    /* variable should be defined */
       strcpy(ptr,symbols[var]);

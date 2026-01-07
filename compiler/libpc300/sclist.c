@@ -34,7 +34,7 @@
 
 /* a "private" implementation of strdup(), so that porting
  * to other memory allocators becomes easier.
- * By Søren Hannibal.
+ * By Sï¿½ren Hannibal.
  */
 SC_FUNC char* duplicatestring(const char* sourcestring)
 {
@@ -93,15 +93,20 @@ static void delete_stringpairtable(stringpair *root)
 
 static stringpair *find_stringpair(stringpair *cur,char *first,int matchlength)
 {
-  int result=0;
+  int cmpresult=0;
 
   assert(matchlength>0);  /* the function cannot handle zero-length comparison */
   assert(first!=NULL);
-  while (cur!=NULL && result<=0) {
-    result=(int)*cur->first - (int)*first;
-    if (result==0 && matchlength==cur->matchlength) {
-      result=strncmp(cur->first,first,matchlength);
-      if (result==0)
+  /* Fast path: since macros are indexed by first character and stored in sorted order,
+   * we can skip nodes with smaller first character immediately, then do exact match. */
+  unsigned char target_first = (unsigned char)*first;
+  while (cur!=NULL) {
+    unsigned char cur_first = (unsigned char)*cur->first;
+    if (cur_first > target_first)
+      break;  /* past where this name would be; not found */
+    if (cur_first == target_first && matchlength==cur->matchlength) {
+      cmpresult=strncmp(cur->first,first,matchlength);
+      if (cmpresult==0)
         return cur;
     } /* if */
     cur=cur->next;
@@ -146,6 +151,26 @@ static stringlist *insert_string(stringlist *root,char *string)
     root=root->next;
   cur->next=root->next;
   root->next=cur;
+  return cur;
+}
+
+/* Tail-appending variant for high-frequency lists to avoid end scans. */
+static stringlist *append_string_tail(stringlist *root, stringlist **tail, char *string)
+{
+  stringlist *cur;
+  assert(string!=NULL);
+  if ((cur=(stringlist*)malloc(sizeof(stringlist)))==NULL)
+    error(103);       /* insufficient memory (fatal error) */
+  if ((cur->line=duplicatestring(string))==NULL)
+    error(103);       /* insufficient memory (fatal error) */
+  cur->next=NULL;
+  assert(root!=NULL);
+  if (*tail == NULL) {
+    /* initialize tail to root sentinel */
+    *tail = root;
+  }
+  (*tail)->next = cur;
+  *tail = cur;
   return cur;
 }
 
@@ -492,6 +517,7 @@ SC_FUNC void delete_heaplisttable(void)
 /* ----- debug information --------------------------------------- */
 
 static stringlist dbgstrings = {NULL, NULL};
+static stringlist *dbgstrings_tail = NULL;
 
 SC_FUNC stringlist *insert_dbgfile(const char *filename)
 {
@@ -501,7 +527,7 @@ SC_FUNC stringlist *insert_dbgfile(const char *filename)
     assert(filename!=NULL);
     assert(strlen(filename)+40<sizeof string);
     sprintf(string,"F:%08lx %s",(long)code_idx,filename);
-    return insert_string(&dbgstrings,string);
+    return append_string_tail(&dbgstrings, &dbgstrings_tail, string);
   } /* if */
   return NULL;
 }
@@ -513,7 +539,7 @@ SC_FUNC stringlist *insert_dbgline(int linenr)
     if (linenr>0)
       linenr--;         /* line numbers are zero-based in the debug information */
     sprintf(string,"L:%08lx %04x",(long)code_idx,linenr);
-    return insert_string(&dbgstrings,string);
+    return append_string_tail(&dbgstrings, &dbgstrings_tail, string);
   } /* if */
   return NULL;
 }
@@ -566,7 +592,7 @@ SC_FUNC stringlist *insert_dbgsymbol(symbol *sym)
       strcat(string,"]");
     } /* if */
 
-    return insert_string(&dbgstrings,string);
+    return append_string_tail(&dbgstrings, &dbgstrings_tail, string);
   } /* if */
   return NULL;
 }
@@ -576,8 +602,45 @@ SC_FUNC char *get_dbgstring(int index)
   return get_string(&dbgstrings,index);
 }
 
+SC_FUNC int dbgstring_count(void)
+{
+  int count = 0;
+  stringlist *cur = dbgstrings.next;
+  while (cur != NULL) {
+    count++;
+    cur = cur->next;
+  }
+  return count;
+}
+
+SC_FUNC char **dbgstring_snapshot(int *count)
+{
+  int n = dbgstring_count();
+  char **arr = (char**)malloc(sizeof(char*) * (n > 0 ? n : 1));
+  if (!arr) {
+    error(103);
+    if (count) *count = 0;
+    return NULL;
+  }
+  stringlist *cur = dbgstrings.next;
+  int i = 0;
+  while (cur != NULL) {
+    arr[i++] = cur->line;
+    cur = cur->next;
+  }
+  if (count) *count = n;
+  return arr;
+}
+
+SC_FUNC void dbgstring_snapshot_free(char **arr)
+{
+  if (arr)
+    free(arr);
+}
+
 SC_FUNC void delete_dbgstringtable(void)
 {
   delete_stringtable(&dbgstrings);
   assert(dbgstrings.next==NULL);
+  dbgstrings_tail = NULL;
 }

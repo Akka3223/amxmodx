@@ -18,6 +18,8 @@ run.options.add_option('--enable-debug', action='store_const', const='1', dest='
                        help='Enable debugging symbols')
 run.options.add_option('--enable-optimize', action='store_const', const='1', dest='opt',
                        help='Enable optimization')
+run.options.add_option('--disable-lto', action='store_true', default=False, dest='disable_lto',
+                       help='Disable Link Time Optimization (enabled by default with --enable-optimize)')
 run.options.add_option('--no-mysql', action='store_true', default=False, dest='disable_mysql',
                        help='Disable building MySQL extension')
 run.options.add_option('--breakpad-dump', action='store_true', dest='breakpad_dump',
