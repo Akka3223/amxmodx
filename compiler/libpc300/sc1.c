@@ -691,9 +691,9 @@ int pc_compile(int argc, char *argv[])
   
   /* ===== INSTRUMENTATION: End FIRST pass ===== */
     clock_t t2_first = clock();
-    fprintf(stderr, "[TIMING] FIRST pass: %.3f sec\n", (double)(t2_first - t1_first) / CLOCKS_PER_SEC);
-    fprintf(stderr, "[TIMING] lex() calls: %lu\n", g_lex_calls);
-    fprintf(stderr, "[TIMING] preprocess() calls: %lu\n", g_preprocess_calls);
+    // fprintf(stderr, "[TIMING] FIRST pass: %.3f sec\n", (double)(t2_first - t1_first) / CLOCKS_PER_SEC);
+    // fprintf(stderr, "[TIMING] lex() calls: %lu\n", g_lex_calls);
+    // fprintf(stderr, "[TIMING] preprocess() calls: %lu\n", g_preprocess_calls);
     g_lex_calls = 0;
     g_preprocess_calls = 0;
   }
@@ -773,9 +773,9 @@ int pc_compile(int argc, char *argv[])
   
   /* ===== INSTRUMENTATION: End WRITE phase ===== */
     clock_t t2_write = clock();
-    fprintf(stderr, "[TIMING] WRITE phase: %.3f sec\n", (double)(t2_write - t1_write) / CLOCKS_PER_SEC);
-    fprintf(stderr, "[TIMING] outbuf: direct_lines=%lu flush_newline=%lu partial_flushes=%lu bytes=%lu\n",
-            g_outbuf_direct_lines, g_outbuf_flush_on_newline, g_outbuf_partial_flushes, g_outbuf_bytes_flushed);
+    // fprintf(stderr, "[TIMING] WRITE phase: %.3f sec\n", (double)(t2_write - t1_write) / CLOCKS_PER_SEC);
+    // fprintf(stderr, "[TIMING] outbuf: direct_lines=%lu flush_newline=%lu partial_flushes=%lu bytes=%lu\n",
+            // g_outbuf_direct_lines, g_outbuf_flush_on_newline, g_outbuf_partial_flushes, g_outbuf_bytes_flushed);
     g_outbuf_direct_lines = 0;
     g_outbuf_flush_on_newline = 0;
     g_outbuf_partial_flushes = 0;
