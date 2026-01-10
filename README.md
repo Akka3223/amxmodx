@@ -1,5 +1,5 @@
 Compiler optimizations for windows, i did not bother myself to make it work on linux since i mainly compile my plugins from windows.
-Compiling a big simple plugin went from 16-17s on average to 2.2-2.4 seconds, which is 7~ times faster.
+Compiling a big plugin went from 16-17s on average to 2.2-2.4 seconds, which is 7~ times faster.
 <p align="center">
  <img src="https://github.com/alliedmodders/amxmodx/blob/master/editor/studio/AMXXLarge.bmp"/>
 </p>
