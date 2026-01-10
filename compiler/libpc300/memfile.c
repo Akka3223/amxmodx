@@ -60,6 +60,26 @@ long memfile_tell(memfile_t *mf)
 	return mf->offs;
 }
 
+int memfile_readline_ptr(memfile_t *mf, const char **ptr, int *len)
+{
+	if (mf->offs >= mf->usedoffs)
+		return 0;
+	long start = mf->offs;
+	long remaining = mf->usedoffs - start;
+	const char *base = mf->base + start;
+	const char *nl = (const char*)memchr(base, '\n', (size_t)remaining);
+	long end;
+	if (nl) {
+		end = (long)(nl - mf->base) + 1; /* include the '\n' */
+	} else {
+		end = mf->usedoffs;
+	}
+	*ptr = mf->base + start;
+	*len = (int)(end - start);
+	mf->offs = end;
+	return 1;
+}
+
 size_t memfile_read(memfile_t *mf, void *buffer, size_t maxsize)
 {
 	if (!maxsize || mf->offs >= mf->usedoffs)

@@ -61,8 +61,20 @@ static void stgstring(char *start,char *end);
 static void stgopt(char *start,char *end);
 
 
-#define sSTG_GROW   512
-#define sSTG_MAX    20480
+/* Grow the staging buffer in larger chunks to reduce realloc frequency
+ * during heavy writes. Keep a reasonable cap to avoid runaway growth. */
+#define sSTG_GROW   8192
+#define sSTG_MAX    32768
+/* Flush chunk limit for direct-output buffering (non-staging).
+ * When the buffer grows past this size, flush up to the last newline
+ * to keep memory use bounded while preserving line integrity. */
+#define OUTBUF_FLUSH_LIMIT 16384
+/* If a newline-terminated fragment is smaller than this threshold and
+ * there is pending buffered output, append then flush once instead of
+ * doing a flush + direct write (reduces syscall count on small tails). */
+#define SMALL_TAIL_BATCH 64
+
+/* Localized restart heuristic removed; stgopt() always restarts from buffer head. */
 
 static char *stgbuf = NULL;
 static int stgmax = 0;  /* current size of the staging buffer */
@@ -70,6 +82,13 @@ static int stgmax = 0;  /* current size of the staging buffer */
  * repeated strlen() calls and quadratic concatenation cost.
  */
 static int outbuf_len = 0;
+/* Track start offset of pending direct-output buffer to avoid memmove
+ * when flushing up to the last newline. */
+static int outbuf_start = 0;
+/* Track the last newline position within the current non-staging buffer
+ * to avoid scanning the entire buffer when partially flushing.
+ * -1 means 'no newline tracked'. */
+static int outbuf_last_nl = -1;
 
 #define CHECK_STGBUFFER(index) if ((int)(index)>=stgmax) grow_stgbuffer((index)+1)
 
@@ -138,6 +157,13 @@ static int filewrite(char *str)
   return TRUE;
 }
 
+static int filewrite_len(char *str,int len)
+{
+  if (sc_status==statWRITE)
+    return pc_writeasm_len(outf,str,len);
+  return TRUE;
+}
+
 /*  stgwrite
  *
  *  Writes the string "st" to the staging buffer or to the output file. In the
@@ -157,29 +183,28 @@ static int filewrite(char *str)
  */
 SC_FUNC void stgwrite(const char *st)
 {
-  size_t slen;
-
   CHECK_STGBUFFER(0);
   if (staging) {
     if (stgidx>=2 && stgbuf[stgidx-1]=='\0' && stgbuf[stgidx-2]!='\n')
       stgidx-=1;                       /* overwrite last '\0' */
-    while (*st!='\0') {                /* copy to staging buffer */
-      CHECK_STGBUFFER(stgidx);
-      stgbuf[stgidx++]=*st++;
-    } /* while */
-    CHECK_STGBUFFER(stgidx);
+    size_t slen = strlen(st);
+    CHECK_STGBUFFER(stgidx + (int)slen + 1);
+    memcpy(stgbuf + stgidx, st, slen);
+    stgidx += (int)slen;
     stgbuf[stgidx++]='\0';
   } else {
-    slen = strlen(st);
-    CHECK_STGBUFFER(outbuf_len + (int)slen + 1);
-    memcpy(stgbuf + outbuf_len, st, slen);
-    outbuf_len += (int)slen;
-    stgbuf[outbuf_len] = '\0';
-    if (outbuf_len > 0 && stgbuf[outbuf_len - 1] == '\n') {
-      filewrite(stgbuf);
-      outbuf_len = 0;
-      stgbuf[0] = '\0';
-    }
+    /* Streaming mode for non-staging: write fragments directly to the
+     * output (memfile) to avoid an extra memcpy into stgbuf. Lines may be
+     * assembled across multiple writes, which is fine because the assembler
+     * reads the complete buffer afterwards.
+     */
+    size_t slen = strlen(st);
+    if (slen == 0)
+      return;
+    filewrite_len((char*)st,(int)slen);
+    g_outbuf_bytes_flushed += (unsigned long)slen;
+    if (st[slen - 1] == '\n')
+      g_outbuf_direct_lines++;
   }
 }
 
@@ -331,8 +356,10 @@ SC_FUNC void stgset(int onoff)
      * when "staging" was 0
      */
     if (outbuf_len > 0) {
-      filewrite(stgbuf);
+      filewrite_len(stgbuf + outbuf_start, outbuf_len - outbuf_start);
       outbuf_len = 0;
+      outbuf_start = 0;
+      outbuf_last_nl = -1;
     }
   } /* if */
   stgbuf[0]='\0';
@@ -344,14 +371,85 @@ SC_FUNC void stgset(int onoff)
  * them (and allocate memory for the sequences).
  */
 static SEQUENCE *sequences = sequences_cmp;
+/* Branchless lowercase helper to avoid locale-dependent tolower() calls. */
+#define LOWER_CHAR(c) ( ((c)>='A' && (c)<='Z') ? (char)((c) + ('a' - 'A')) : (c) )
+/* Prefilter: first alphabetic char (lowercased) of each sequence's find
+ * pattern to quickly reject impossible matches without calling
+ * matchsequence(). Computed in phopt_init(). For patterns that start with
+ * non-alphabetic/meta tokens, the entry is 0 (no prefilter).
+ */
+static unsigned char *seq_first_lower = NULL;
+static int sequences_count = 0;
+/* Lowercased copy of each 'find' pattern for cheaper case-insensitive
+ * comparisons. Meta characters ('%', '!', ' ', '-') are left untouched. */
+static char **seq_find_lower = NULL;
+/* Reusable scratch buffer for sequence replacements to avoid malloc/free churn. */
+static char *repl_scratch = NULL;
+static int repl_scratch_size = 0;
 
 SC_FUNC int phopt_init(void)
 {
+  /* Count sequences */
+  int i, j;
+  for (i = 0; sequences[i].find != NULL; i++)
+    /* nothing */;
+  sequences_count = i;
+  seq_first_lower = (unsigned char*)malloc((size_t)sequences_count);
+  if (seq_first_lower == NULL)
+    return FALSE;
+  seq_find_lower = (char**)malloc(sizeof(char*) * (size_t)sequences_count);
+  if (seq_find_lower == NULL)
+    return FALSE;
+  /* Compute first alphabetic literal per find-pattern */
+  for (i = 0; i < sequences_count; i++) {
+    const char *p = sequences[i].find;
+    unsigned char c = 0;
+    size_t len = strlen(p);
+    char *lower = (char*)malloc(len + 1);
+    if (!lower)
+      return FALSE;
+    /* Build lowercase-only copy */
+    for (j = 0; p[j] != '\0'; j++) {
+      char ch = p[j];
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+        lower[j] = LOWER_CHAR(ch);
+      else
+        lower[j] = ch;
+    }
+    lower[len] = '\0';
+    seq_find_lower[i] = lower;
+    for (j = 0; p[j] != '\0'; j++) {
+      char ch = p[j];
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+        c = (unsigned char)LOWER_CHAR(ch);
+        break;
+      }
+      /* stop early on meta that implies non-literal start */
+      if (ch == '%' || ch == '!' || ch == ' ' || ch == '-')
+        break;
+    }
+    seq_first_lower[i] = c; /* 0 means 'no prefilter' */
+  }
   return TRUE;
 }
 
 SC_FUNC int phopt_cleanup(void)
 {
+  if (seq_first_lower) {
+    free(seq_first_lower);
+    seq_first_lower = NULL;
+  }
+  if (seq_find_lower) {
+    for (int i = 0; i < sequences_count; i++)
+      free(seq_find_lower[i]);
+    free(seq_find_lower);
+    seq_find_lower = NULL;
+  }
+  if (repl_scratch) {
+    free(repl_scratch);
+    repl_scratch = NULL;
+    repl_scratch_size = 0;
+  }
   return FALSE;
 }
 
@@ -363,52 +461,96 @@ SC_FUNC int phopt_cleanup(void)
   #define MAX_ALIAS       (PAWN_CELL_SIZE/4) * MAX_OPT_CAT
 #endif
 
-/* Branchless lowercase helper to avoid locale-dependent tolower() calls. */
-#define LOWER_CHAR(c) ( ((c)>='A' && (c)<='Z') ? (char)((c) + ('a' - 'A')) : (c) )
+  /* Fast ASCII checks to avoid function calls in hot loops. */
+  static inline int is_alpha_fast(char c) {
+    return (c>='A' && c<='Z') || (c>='a' && c<='z');
+  }
+  static inline int is_digit_fast(char c) {
+    return (c>='0' && c<='9');
+  }
+  static inline int is_alphanum_fast(char c) {
+    return is_alpha_fast(c) || is_digit_fast(c) || c=='_';
+  }
+  static inline int is_alias_char(char c) {
+    return c=='-' || c=='+' || is_alphanum_fast(c);
+  }
 
 static int matchsequence(const char *start,const char *end,const char *pattern,
                          char symbols[MAX_OPT_VARS][MAX_ALIAS+1],
+                         int alias_len[MAX_OPT_VARS],
                          int *match_length)
 {
   int var,i;
-  char str[MAX_ALIAS+1];
   const char *start_org=start;
   cell value;
   char *ptr;
 
   *match_length=0;
-  for (var=0; var<MAX_OPT_VARS; var++)
+  for (var=0; var<MAX_OPT_VARS; var++) {
     symbols[var][0]='\0';
+    alias_len[var]=0;
+  }
 
   while (*start=='\t' || *start==' ')
     start++;
   while (*pattern) {
     if (start>=end)
       return FALSE;
+    /* Fast path: consume contiguous literal characters until a meta token. */
+    if (*pattern!='%' && *pattern!='!' && *pattern!=' ' && *pattern!='-') {
+      const char *pl = pattern;
+      const char *s = start;
+      while (s<end) {
+        char cp = *pl;
+        if (!cp || cp=='%' || cp=='!' || cp==' ' || cp=='-')
+          break;
+        char cs = *s;
+        if (cs != cp) {
+          /* Only case-fold when pattern char is alphabetic (already lowered). */
+          if ((cp >= 'a' && cp <= 'z')) {
+            if (LOWER_CHAR(cs) != cp)
+              return FALSE;
+          } else {
+            return FALSE;
+          }
+        }
+        s++; pl++;
+      }
+      start = s;
+      pattern = pl;
+      continue;
+    }
     switch (*pattern) {
     case '%':   /* new "symbol" */
       pattern++;
       assert(isdigit(*pattern));
       var = (*pattern - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
-      assert(*start=='-' || alphanum(*start));
-      for (i=0; start<end && (*start=='-' || *start=='+' || alphanum(*start)); i++,start++) {
-        assert(i<=MAX_ALIAS);
-        str[i]=*start;
-      } /* for */
-      str[i]='\0';
-      if (symbols[var][0]!='\0') {
-        if (strcmp(symbols[var],str)!=0)
-          return FALSE; /* symbols should be identical */
-      } else {
-        strcpy(symbols[var],str);
-      } /* if */
+      assert(*start=='-' || is_alphanum_fast(*start));
+      {
+        const char *p = start;
+        while (p<end && is_alias_char(*p))
+          p++;
+        i = (int)(p - start);
+        if (i > MAX_ALIAS)
+          i = MAX_ALIAS;
+        if (symbols[var][0] != '\0') {
+          if (alias_len[var] != i || memcmp(symbols[var], start, (size_t)i) != 0)
+            return FALSE; /* symbols should be identical */
+        } else {
+          memcpy(symbols[var], start, (size_t)i);
+          symbols[var][i] = '\0';
+          alias_len[var] = i;
+        }
+        start = p;
+      }
       break;
     case '-':
       value=-strtol(pattern+1,(char **)&pattern,16);
       ptr=itoh((ucell)value);
       while (*ptr!='\0') {
-        if (LOWER_CHAR(*start) != LOWER_CHAR(*ptr))
+        /* itoh() emits lowercase hex; avoid redundant LOWER_CHAR() on ptr */
+        if (LOWER_CHAR(*start) != *ptr)
           return FALSE;
         start++;
         ptr++;
@@ -418,23 +560,36 @@ static int matchsequence(const char *start,const char *end,const char *pattern,
     case ' ':
       if (*start!='\t' && *start!=' ')
         return FALSE;
-      while ((start<end && *start=='\t') || *start==' ')
+      /* guard bounds for both space and tab */
+      while (start<end && (*start=='\t' || *start==' '))
         start++;
       break;
     case '!':
-      while ((start<end && *start=='\t') || *start==' ')
+      while (start<end && (*start=='\t' || *start==' '))
         start++;                /* skip trailing white space */
       if (*start!='\n')
         return FALSE;
       assert(*(start+1)=='\0');
       start+=2;                 /* skip '\n' and '\0' */
-      if (*(pattern+1)!='\0')
-        while ((start<end && *start=='\t') || *start==' ')
-          start++;              /* skip leading white space of next instruction */
+      if (*(pattern+1)!='\0') {
+        /* skip leading whitespace of next instruction; guard end before deref */
+        while (start<end && (*start=='\t' || *start==' '))
+          start++;
+      }
       break;
     default:
-      if (LOWER_CHAR(*start) != LOWER_CHAR(*pattern))
-        return FALSE;
+      {
+        char cp = *pattern;
+        char cs = *start;
+        if (cs != cp) {
+          if ((cp >= 'a' && cp <= 'z')) {
+            if (LOWER_CHAR(cs) != cp)
+              return FALSE;
+          } else {
+            return FALSE;
+          }
+        }
+      }
       start++;
     } /* switch */
     pattern++;
@@ -444,7 +599,11 @@ static int matchsequence(const char *start,const char *end,const char *pattern,
   return TRUE;
 }
 
-static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_ALIAS+1],int *repl_length)
+
+static char *replacesequence(const char *pattern,
+                             char symbols[MAX_OPT_VARS][MAX_ALIAS+1],
+                             int alias_len[MAX_OPT_VARS],
+                             int *repl_length)
 {
   const char *lptr;
   int var;
@@ -466,7 +625,7 @@ static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_
       var = (*lptr - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
       assert(symbols[var][0]!='\0');    /* variable should be defined */
-      *repl_length+=strlen(symbols[var]);
+      *repl_length+=alias_len[var];
       break;
     case '!':
       *repl_length+=3;  /* '\t', '\n' & '\0' */
@@ -477,9 +636,15 @@ static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_
     lptr++;
   } /* while */
 
-  /* allocate a buffer to replace the sequence in */
-  if ((buffer=(char*)malloc(*repl_length))==NULL)
-    return (char*)error(103);
+  /* allocate or grow a reusable scratch buffer */
+  if (repl_scratch_size < *repl_length) {
+    char *nbuf = (char*)realloc(repl_scratch, *repl_length);
+    if (!nbuf)
+      return (char*)error(103);
+    repl_scratch = nbuf;
+    repl_scratch_size = *repl_length;
+  }
+  buffer = repl_scratch;
 
   /* replace the pattern into this temporary buffer */
   char *ptr=buffer;
@@ -494,8 +659,8 @@ static char *replacesequence(const char *pattern,char symbols[MAX_OPT_VARS][MAX_
       var = (*pattern - '0') - 1; /* single digit 1..4 */
       assert(var>=0 && var<MAX_OPT_VARS);
       assert(symbols[var][0]!='\0');    /* variable should be defined */
-      strcpy(ptr,symbols[var]);
-      ptr+=strlen(symbols[var]);
+      memcpy(ptr, symbols[var], (size_t)alias_len[var]);
+      ptr+=alias_len[var];
       break;
     case '!':
       /* finish the line, optionally start the next line with an indent */
@@ -519,7 +684,6 @@ static void strreplace(char *dest,char *replace,int sub_length,int repl_length,i
   int offset=sub_length-repl_length;
   if (offset>0) {               /* delete a section */
     memmove(dest,dest+offset,dest_length-offset);
-    memset(dest+dest_length-offset,0xcc,offset); /* not needed, but for cleanlyness */
   } else if (offset<0) {        /* insert a section */
     memmove(dest-offset, dest, dest_length);
   } /* if */
@@ -538,9 +702,11 @@ static void strreplace(char *dest,char *replace,int sub_length,int repl_length,i
 static void stgopt(char *start,char *end)
 {
   char symbols[MAX_OPT_VARS][MAX_ALIAS+1];
+  int alias_len[MAX_OPT_VARS];
   int seq,match_length,repl_length;
   int matches;
   char *debut=start;
+  /* Heuristic removed: no localized restart, keep behavior simple & fast. */
 
   assert(sequences!=NULL);
   /* do not match anything if debug-level is maximum */
@@ -550,10 +716,33 @@ static void stgopt(char *start,char *end)
       start=debut;
       while (start<end) {
         seq=0;
+        /* Compute start's first alphabetic character once for all sequence checks. */
+        const char *slead = start;
+        while (slead<end && (*slead=='\t' || *slead==' '))
+          slead++;
+        unsigned char cs = 0;
+        if (slead < end) {
+          char ch = *slead;
+          if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+            cs = (unsigned char)LOWER_CHAR(ch);
+        }
         while (sequences[seq].find!=NULL) {
           assert(seq>=0);
-          if (matchsequence(start,end,sequences[seq].find,symbols,&match_length)) {
-            char *replace=replacesequence(sequences[seq].replace,symbols,&repl_length);
+          /* Quick reject: compare first alphabetic char of the instruction
+           * against the precomputed first-letter filter of the pattern. If
+           * the pattern expects a letter and the instruction doesn't start
+           * with one, skip it too. */
+          if (seq_first_lower) {
+            unsigned char fl = seq_first_lower[seq];
+            if (fl != 0) {
+              if (cs == 0 || fl != cs) {
+                seq++;
+                continue;
+              }
+            }
+          }
+          if (matchsequence(start,end,seq_find_lower ? seq_find_lower[seq] : sequences[seq].find,symbols,alias_len,&match_length)) {
+            char *replace=replacesequence(sequences[seq].replace,symbols,alias_len,&repl_length);
             /* If the replacement is bigger than the original section, we may need
              * to "grow" the staging buffer. This is quite complex, due to the
              * re-ordering of expressions that can also happen in the staging
@@ -566,10 +755,11 @@ static void stgopt(char *start,char *end)
             if (match_length>=repl_length) {
               strreplace(start,replace,match_length,repl_length,(int)(end-start));
               end-=match_length-repl_length;
-              free(replace);
               code_idx-=sequences[seq].savesize;
-              seq=0;                      /* restart search for matches */
+              /* restart search for matches at the beginning of this line */
+              seq=0;
               matches++;
+              /* localized restart heuristic removed */
             } else {
               /* actually, we should never get here (match_length<repl_length) */
               assert(0);
@@ -580,13 +770,16 @@ static void stgopt(char *start,char *end)
           } /* if */
         } /* while */
         assert(sequences[seq].find==NULL);
-        start += strlen(start) + 1;       /* to next string */
+        while (*start++ != '\0') { /* to next string */ }
       } /* while (start<end) */
+      /* Always restart from buffer head; no localized restart. */
     } while (matches>0);
   } /* if ((sc_debug & sNOOPTIMIZE)==0 && sc_status==statWRITE) */
 
-  for (start=debut; start<end; start+=strlen(start)+1)
+  for (start=debut; start<end;) {
     filewrite(start);
+    while (*start++ != '\0') { /* to next string */ }
+  }
 }
 
 #undef SCPACK_TABLE

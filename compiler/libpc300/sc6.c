@@ -189,6 +189,25 @@ static char *stripcomment(char *str)
   return str;
 }
 
+/* ASCII-only case-insensitive comparator to avoid locale overhead. */
+static int sc_fast_stricmp(const char *a, const char *b)
+{
+  while (*a && *b) {
+    unsigned char ca = (unsigned char)*a;
+    unsigned char cb = (unsigned char)*b;
+    if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+    if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+    if (ca != cb)
+      return (int)ca - (int)cb;
+    a++; b++;
+  }
+  unsigned char ca = (unsigned char)*a;
+  unsigned char cb = (unsigned char)*b;
+  if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+  if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+  return (int)ca - (int)cb;
+}
+
 static void write_encoded(FILE *fbin,ucell *c,int num)
 {
   #if PAWN_CELL_SIZE == 16
@@ -533,33 +552,75 @@ static OPCODE opcodelist[] = {
 #define MAX_INSTR_LEN   30
 static int findopcode(char *instr,int maxlen)
 {
-  int low,high,mid,cmp;
   char str[MAX_INSTR_LEN];
 
   if (maxlen>=MAX_INSTR_LEN)
     return 0;
   strncpy(str,instr,maxlen);
   str[maxlen]='\0';     /* make sure the string is zero terminated */
-  /* look up the instruction with a binary search
-   * the assembler is case insensitive to instructions (but case sensitive
-   * to symbols)
-   */
-  low=1;                /* entry 0 is reserved (for "not found") */
-  high=(sizeof opcodelist / sizeof opcodelist[0])-1;
-  while (low<high) {
-    mid=(low+high)/2;
-    assert(opcodelist[mid].name!=NULL);
-    cmp=stricmp(str,opcodelist[mid].name);
-    if (cmp>0)
-      low=mid+1;
-    else
-      high=mid;
-  } /* while */
-
-  assert(low==high);
-  if (stricmp(str,opcodelist[low].name)==0)
-    return low;         /* found */
-  return 0;             /* not found, return special index */
+  /* Hash-based lookup for case-insensitive opcode match. */
+  {
+    /* Lazy init: build buckets of lowercased opcode names mapped to index. */
+    #define OP_BUCKETS 257
+    typedef struct OpNode { char *key; int idx; struct OpNode *next; } OpNode;
+    static OpNode *op_buckets[OP_BUCKETS];
+    static int op_init = 0;
+    if (!op_init) {
+      int i;
+      for (i = 1; i < (int)(sizeof opcodelist / sizeof opcodelist[0]); i++) {
+        const char *name = opcodelist[i].name;
+        char lower[MAX_INSTR_LEN];
+        int j;
+        for (j = 0; name[j] != '\0' && j < MAX_INSTR_LEN-1; j++) {
+          unsigned char c = (unsigned char)name[j];
+          if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+          lower[j] = (char)c;
+        }
+        lower[j] = '\0';
+        /* djb2 hash */
+        unsigned int h = 5381u;
+        for (int k = 0; lower[k] != '\0'; k++)
+          h = ((h << 5) + h) + (unsigned char)lower[k];
+        h %= OP_BUCKETS;
+        OpNode *node = (OpNode*)malloc(sizeof(OpNode));
+        if (!node)
+          continue;
+        node->key = (char*)malloc(strlen(lower)+1);
+        if (!node->key) {
+          free(node);
+          continue;
+        }
+        strcpy(node->key, lower);
+        node->idx = i;
+        node->next = op_buckets[h];
+        op_buckets[h] = node;
+      }
+      op_init = 1;
+    }
+    /* Lowercase the query string. */
+    char qlower[MAX_INSTR_LEN];
+    {
+      int j;
+      for (j = 0; str[j] != '\0' && j < MAX_INSTR_LEN-1; j++) {
+        unsigned char c = (unsigned char)str[j];
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+        qlower[j] = (char)c;
+      }
+      qlower[j] = '\0';
+    }
+    /* djb2 hash for query. */
+    unsigned int hq = 5381u;
+    for (int k = 0; qlower[k] != '\0'; k++)
+      hq = ((hq << 5) + hq) + (unsigned char)qlower[k];
+    hq %= OP_BUCKETS;
+    OpNode *cur = op_buckets[hq];
+    while (cur) {
+      if (strcmp(cur->key, qlower) == 0)
+        return cur->idx;
+      cur = cur->next;
+    }
+    return 0;
+  }
 }
 
 SC_FUNC int assemble(FILE *fout,FILE *fin)
@@ -857,7 +918,41 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
       error(103);               /* insufficient memory */
     codeindex=0;
     pc_resetasm(fin);
-    while (pc_readasm(fin,line,sizeof line)!=NULL) {
+    for (;;) {
+      char *lptr = NULL; int llen = 0;
+      if (pc_readasm_ptr(fin,&lptr,&llen)) {
+        /* temporarily NUL-terminate the line for existing helpers */
+        if (llen > 0) {
+          char save = lptr[llen-1];
+          lptr[llen-1] = '\0';
+          stripcomment(lptr);
+          instr=skipwhitespace(lptr);
+          /* ignore empty lines */
+          if (*instr=='\0') { lptr[llen-1] = save; continue; }
+          if (tolower(*instr)=='l' && *(instr+1)=='.') {
+            int lindex=(int)hex2long(instr+2,NULL);
+            assert(lindex>=0 && lindex<sc_labnum);
+            lbltab[lindex]=codeindex;
+          } else {
+            for (params=instr; *params!='\0' && !isspace(*params); params++)
+              /* nothing */;
+            assert(params>instr);
+            i=findopcode(instr,(int)(params-instr));
+            if (opcodelist[i].name==NULL) {
+              *params='\0';
+              error(104,instr);
+            }
+            if (opcodelist[i].segment==sIN_CSEG)
+              codeindex+=opcodelist[i].func(NULL,skipwhitespace(params),opcodelist[i].opcode);
+          }
+          lptr[llen-1] = save;
+          continue;
+        }
+      }
+      if (pc_readasm(fin,line,sizeof line)==NULL) {
+        break;
+      }
+      /* Fallback copy-based path */
       stripcomment(line);
       instr=skipwhitespace(line);
       /* ignore empty lines */
@@ -890,7 +985,30 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   bytes_out=0;
   for (pass=sIN_CSEG; pass<=sIN_DSEG; pass++) {
     pc_resetasm(fin);
-    while (pc_readasm(fin,line,sizeof line)!=NULL) {
+    for (;;) {
+      char *lptr2 = NULL; int llen2 = 0;
+      if (pc_readasm_ptr(fin,&lptr2,&llen2)) {
+        if (llen2 > 0) {
+          char save2 = lptr2[llen2-1];
+          lptr2[llen2-1] = '\0';
+          stripcomment(lptr2);
+          instr=skipwhitespace(lptr2);
+          if (*instr=='\0' || (tolower(*instr)=='l' && *(instr+1)=='.')) { lptr2[llen2-1]=save2; continue; }
+          for (params=instr; *params!='\0' && !isspace(*params); params++)
+            /* nothing */;
+          assert(params>instr);
+          i=findopcode(instr,(int)(params-instr));
+          assert(opcodelist[i].name!=NULL);
+          if (opcodelist[i].segment==pass)
+            opcodelist[i].func(fout,skipwhitespace(params),opcodelist[i].opcode);
+          lptr2[llen2-1] = save2;
+          continue;
+        }
+      }
+      if (pc_readasm(fin,line,sizeof line)==NULL) {
+        break;
+      }
+      /* Fallback copy-based path */
       stripcomment(line);
       instr=skipwhitespace(line);
       /* ignore empty lines and labels (labels have a special syntax, so these

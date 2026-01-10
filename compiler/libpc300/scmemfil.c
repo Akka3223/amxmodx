@@ -51,7 +51,8 @@ typedef memfile_t MEMFILE;
 
 MEMFILE *mfcreate(char *filename)
 {
-  return memfile_creat(filename, 4096);
+  /* Increase initial memfile buffer to reduce realloc churn during assembly */
+  return memfile_creat(filename, 16384);
 }
 
 void mfclose(MEMFILE *mf)
@@ -162,6 +163,19 @@ char *mfgets(MEMFILE *mf,char *string,unsigned int size)
     mfseek(mf,seek,SEEK_CUR);
 
   return string;
+}
+
+/* Zero-copy line fetch: exposes pointer to the next line in MEMFILE.
+ * Returns 1 on success, 0 on EOF. */
+int mfreadlineptr(MEMFILE *mf, char **ptr, int *len)
+{
+  const char *p;
+  int l;
+  if (!memfile_readline_ptr(mf, &p, &l))
+    return 0;
+  *ptr = (char*)p; /* safe cast, caller may modify in-place */
+  *len = l;
+  return 1;
 }
 
 int mfputs(MEMFILE *mf,char *string)

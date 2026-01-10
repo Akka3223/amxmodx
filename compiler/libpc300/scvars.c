@@ -84,6 +84,14 @@ SC_VDEFINE int sc_status;          /* read/write status */
 SC_VDEFINE int sc_rationaltag=0;   /* tag for rational numbers */
 SC_VDEFINE int rational_digits=0;  /* number of fractional digits */
 SC_VDEFINE int sc_allowproccall=0; /* allow/detect tagnames in lex() */
+
+/* Instrumentation counters */
+SC_VDEFINE unsigned long g_lex_calls = 0;
+SC_VDEFINE unsigned long g_preprocess_calls = 0;
+SC_VDEFINE unsigned long g_outbuf_direct_lines = 0;
+SC_VDEFINE unsigned long g_outbuf_flush_on_newline = 0;
+SC_VDEFINE unsigned long g_outbuf_partial_flushes = 0;
+SC_VDEFINE unsigned long g_outbuf_bytes_flushed = 0;
 SC_VDEFINE char *pc_deprecate = NULL;/* if non-null, mark next declaration as deprecated */
 SC_VDEFINE int sc_showincludes=0;  /* show include files */
 SC_VDEFINE int sc_warnings_are_errors=0;

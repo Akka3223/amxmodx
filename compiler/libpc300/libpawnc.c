@@ -275,21 +275,52 @@ char *pc_readsrc(void *handle,unsigned char *target,int maxchars)
   if (src->pos == src->end)
     return NULL;
 
-  while (outptr < outend && src->pos < src->end) {
-    char c = *src->pos++;
-    *outptr++ = c;
+  // Fast scan to the next line terminator using memchr.
+  const char *start = src->pos;
+  const char *remaining_end = src->end;
 
-    if (c == '\n')
-      break;
-    if (c == '\r') {
-      // Handle CRLF.
-      if (src->pos < src->end && *src->pos == '\n') {
-        src->pos++;
-        if (outptr < outend)
-          *outptr++ = '\n';
+  const char *nl = NULL;
+  const char *cr = NULL;
+
+  // Find next '\n' and '\r'; choose earliest if present.
+  size_t remaining = (size_t)(remaining_end - start);
+  if (remaining > 0) {
+    nl = (const char *)memchr(start, '\n', remaining);
+    cr = (const char *)memchr(start, '\r', remaining);
+  }
+
+  const char *term = NULL;
+  if (nl && cr)
+    term = (nl < cr ? nl : cr);
+  else if (nl)
+    term = nl;
+  else if (cr)
+    term = cr;
+
+  if (term) {
+    // Copy up to and including terminator, subject to maxchars.
+    size_t to_copy = (size_t)(term - start + 1);
+    if (to_copy > (size_t)maxchars)
+      to_copy = (size_t)maxchars;
+    memcpy(outptr, start, to_copy);
+    outptr += to_copy;
+    src->pos = (char *)(start + (size_t)(term - start + 1));
+
+    // If CRLF, append '\n' if space remains and adjust src->pos.
+    if (*term == '\r' && src->pos < src->end && *src->pos == '\n') {
+      src->pos++;
+      if (outptr < outend) {
+        *outptr++ = '\n';
       }
-      break;
     }
+  } else {
+    // No terminator found: copy remainder up to maxchars.
+    size_t to_copy = remaining;
+    if (to_copy > (size_t)maxchars)
+      to_copy = (size_t)maxchars;
+    memcpy(outptr, start, to_copy);
+    outptr += to_copy;
+    src->pos = (char *)(start + to_copy);
   }
 
   // Caller passes in a buffer of size >= maxchars+1.
@@ -398,6 +429,15 @@ int pc_writeasm(void *handle,char *string)
   #endif
 }
 
+int pc_writeasm_len(void *handle,const char *string,int len)
+{
+  #if defined __MSDOS__ || defined SC_LIGHT
+    return (int)fwrite(string,1,(size_t)len,(FILE*)handle) == len;
+  #else
+    return (int)mfwrite((MEMFILE*)handle,(unsigned char*)string,(unsigned int)len) == (unsigned int)len;
+  #endif
+}
+
 char *pc_readasm(void *handle, char *string, int maxchars)
 {
   #if defined __MSDOS__ || defined SC_LIGHT
@@ -405,6 +445,16 @@ char *pc_readasm(void *handle, char *string, int maxchars)
   #else
     return mfgets((MEMFILE*)handle,string,maxchars);
   #endif
+}
+
+int pc_readasm_ptr(void *handle, char **ptr, int *len)
+{
+#if defined __MSDOS__ || defined SC_LIGHT
+  (void)handle; (void)ptr; (void)len;
+  return 0;
+#else
+  return mfreadlineptr((MEMFILE*)handle, ptr, len);
+#endif
 }
 
 /* Should return a pointer, which is used as a "magic cookie" to all I/O

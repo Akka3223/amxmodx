@@ -142,6 +142,52 @@ static void include_cache_store(const char *base,
   e->found = found;
 }
 
+/*
+ * Symbol allocator: a simple object pool to reduce malloc/free overhead
+ * for the hot add/delete symbol paths. Allocates symbols in blocks and
+ * maintains a free list for reuse. Semantics remain identical.
+ */
+#define SYMBOL_BLOCK_SIZE 256
+typedef struct SymbolBlock {
+  symbol *items;
+  struct SymbolBlock *next;
+} SymbolBlock;
+static symbol *sym_free_list = NULL;
+static SymbolBlock *sym_blocks = NULL;
+
+static symbol *sym_alloc(void)
+{
+  if (sym_free_list == NULL) {
+    SymbolBlock *blk = (SymbolBlock*)malloc(sizeof(SymbolBlock));
+    if (!blk)
+      return NULL;
+    blk->items = (symbol*)malloc(sizeof(symbol) * SYMBOL_BLOCK_SIZE);
+    if (!blk->items) {
+      free(blk);
+      return NULL;
+    }
+    blk->next = sym_blocks;
+    sym_blocks = blk;
+    /* Push all items onto the free list */
+    for (int i = 0; i < SYMBOL_BLOCK_SIZE; i++) {
+      symbol *it = &blk->items[i];
+      it->next = sym_free_list;
+      sym_free_list = it;
+    }
+  }
+  symbol *s = sym_free_list;
+  sym_free_list = sym_free_list->next;
+  return s;
+}
+
+static void sym_free(symbol *s)
+{
+  if (!s)
+    return;
+  s->next = sym_free_list;
+  sym_free_list = s;
+}
+
 SC_FUNC void pushstk(stkitem val)
 {
   assert(stkidx<=stktop);
@@ -1913,6 +1959,7 @@ static int scanplus(const unsigned char *lptr)
  */
 SC_FUNC void preprocess(void)
 {
+  g_preprocess_calls++;
   int iscommand;
 
   if (!freading)
@@ -2031,6 +2078,124 @@ static cell _lexval;
 static char _lexstr[sLINEMAX+1];
 static int _lexnewline;
 
+// Fast keyword lookup for common tokens to avoid linear scans over sc_tokens.
+// Returns token id on match, or 0 if no match.
+static int quick_keyword(const unsigned char *p)
+{
+  // Handle compiler directives starting with '#'.
+  if (*p == '#') {
+    p++;
+    switch (*p) {
+      case 'a':
+        // assert
+        if (p[1]=='s' && p[2]=='s' && p[3]=='e' && p[4]=='r' && p[5]=='t' && !alphanum(p[6])) return tpASSERT;
+        break;
+      case 'd':
+        // define
+        if (p[1]=='e' && p[2]=='f' && p[3]=='i' && p[4]=='n' && p[5]=='e' && !alphanum(p[6])) return tpDEFINE;
+        break;
+      case 'e':
+        // else / elseif / emit / endif / endinput / endscript / error
+        if (p[1]=='l' && p[2]=='s' && p[3]=='e' && !alphanum(p[4])) return tpELSE;
+        if (p[1]=='l' && p[2]=='s' && p[3]=='e' && p[4]=='i' && p[5]=='f' && !alphanum(p[6])) return tpELSEIF;
+        if (p[1]=='m' && p[2]=='i' && p[3]=='t' && !alphanum(p[4])) return tpEMIT;
+        if (p[1]=='n' && p[2]=='d' && p[3]=='i' && p[4]=='n' && p[5]=='p' && p[6]=='u' && p[7]=='t' && !alphanum(p[8])) return tpENDINPUT;
+        if (p[1]=='n' && p[2]=='d' && p[3]=='s' && p[4]=='c' && p[5]=='r' && p[6]=='i' && p[7]=='p' && p[8]=='t' && !alphanum(p[9])) return tpENDSCRPT;
+        if (p[1]=='r' && p[2]=='r' && p[3]=='o' && p[4]=='r' && !alphanum(p[5])) return tpERROR;
+        break;
+      case 'f':
+        // file
+        if (p[1]=='i' && p[2]=='l' && p[3]=='e' && !alphanum(p[4])) return tpFILE;
+        break;
+      case 'i':
+        // if / include
+        if (p[1]=='f' && !alphanum(p[2])) return tpIF;
+        if (p[1]=='n' && p[2]=='c' && p[3]=='l' && p[4]=='u' && p[5]=='d' && p[6]=='e' && !alphanum(p[7])) return tINCLUDE;
+        break;
+      case 'l':
+        // line
+        if (p[1]=='i' && p[2]=='n' && p[3]=='e' && !alphanum(p[4])) return tpLINE;
+        break;
+      case 'p':
+        // pragma
+        if (p[1]=='r' && p[2]=='a' && p[3]=='g' && p[4]=='m' && p[5]=='a' && !alphanum(p[6])) return tpPRAGMA;
+        break;
+      case 't':
+        // tryinclude
+        if (p[1]=='r' && p[2]=='y' && p[3]=='i' && p[4]=='n' && p[5]=='c' && p[6]=='l' && p[7]=='u' && p[8]=='d' && p[9]=='e' && !alphanum(p[10])) return tpTRYINCLUDE;
+        break;
+      case 'u':
+        // undef
+        if (p[1]=='n' && p[2]=='d' && p[3]=='e' && p[4]=='f' && !alphanum(p[5])) return tpUNDEF;
+        break;
+    }
+    return 0;
+  }
+
+  // Regular keywords.
+  switch (*p) {
+    case 'a':
+      if (p[1]=='s' && p[2]=='s' && p[3]=='e' && p[4]=='r' && p[5]=='t' && !alphanum(p[6])) return tASSERT;
+      break;
+    case 'b':
+      if (p[1]=='r' && p[2]=='e' && p[3]=='a' && p[4]=='k' && !alphanum(p[5])) return tBREAK;
+      break;
+    case 'c':
+      if (p[1]=='a' && p[2]=='s' && p[3]=='e' && !alphanum(p[4])) return tCASE;
+      if (p[1]=='o' && p[2]=='n' && p[3]=='s' && p[4]=='t' && !alphanum(p[5])) return tCONST;
+      if (p[1]=='o' && p[2]=='n' && p[3]=='t' && p[4]=='i' && p[5]=='n' && p[6]=='u' && p[7]=='e' && !alphanum(p[8])) return tCONTINUE;
+      if (p[1]=='h' && p[2]=='a' && p[3]=='r' && !alphanum(p[4])) return tCHAR;
+      if (p[1]=='d' && p[2]=='e' && p[3]=='f' && p[4]=='a' && p[5]=='u' && p[6]=='l' && p[7]=='t' && !alphanum(p[8])) return tDEFAULT;
+      break;
+    case 'd':
+      if (p[1]=='o' && !alphanum(p[2])) return tDO;
+      break;
+    case 'e':
+      if (p[1]=='l' && p[2]=='s' && p[3]=='e' && !alphanum(p[4])) return tELSE;
+      if (p[1]=='n' && p[2]=='u' && p[3]=='m' && !alphanum(p[4])) return tENUM;
+      if (p[1]=='x' && p[2]=='i' && p[3]=='t' && !alphanum(p[4])) return tEXIT;
+      break;
+    case 'f':
+      if (p[1]=='o' && p[2]=='r' && !alphanum(p[3])) return tFOR;
+      if (p[1]=='o' && p[2]=='r' && p[3]=='w' && p[4]=='a' && p[5]=='r' && p[6]=='d' && !alphanum(p[7])) return tFORWARD;
+      break;
+    case 'g':
+      if (p[1]=='o' && p[2]=='t' && p[3]=='o' && !alphanum(p[4])) return tGOTO;
+      break;
+    case 'i':
+      if (p[1]=='f' && !alphanum(p[2])) return tIF;
+      break;
+    case 'n':
+      if (p[1]=='a' && p[2]=='t' && p[3]=='i' && p[4]=='v' && p[5]=='e' && !alphanum(p[6])) return tNATIVE;
+      if (p[1]=='e' && p[2]=='w' && !alphanum(p[3])) return tNEW;
+      break;
+    case 'o':
+      if (p[1]=='p' && p[2]=='e' && p[3]=='r' && p[4]=='a' && p[5]=='t' && p[6]=='o' && p[7]=='r' && !alphanum(p[8])) return tOPERATOR;
+      break;
+    case 'p':
+      if (p[1]=='u' && p[2]=='b' && p[3]=='l' && p[4]=='i' && p[5]=='c' && !alphanum(p[6])) return tPUBLIC;
+      break;
+    case 'r':
+      if (p[1]=='e' && p[2]=='t' && p[3]=='u' && p[4]=='r' && p[5]=='n' && !alphanum(p[6])) return tRETURN;
+      break;
+    case 's':
+      if (p[1]=='i' && p[2]=='z' && p[3]=='e' && p[4]=='o' && p[5]=='f' && !alphanum(p[6])) return tSIZEOF;
+      if (p[1]=='l' && p[2]=='e' && p[3]=='e' && p[4]=='p' && !alphanum(p[5])) return tSLEEP;
+      if (p[1]=='t' && p[2]=='a' && p[3]=='t' && p[4]=='e' && !alphanum(p[5])) return tSTATE;
+      if (p[1]=='t' && p[2]=='a' && p[3]=='t' && p[4]=='i' && p[5]=='c' && !alphanum(p[6])) return tSTATIC;
+      if (p[1]=='t' && p[2]=='o' && p[3]=='c' && p[4]=='k' && !alphanum(p[5])) return tSTOCK;
+      if (p[1]=='w' && p[2]=='i' && p[3]=='t' && p[4]=='c' && p[5]=='h' && !alphanum(p[6])) return tSWITCH;
+      break;
+    case 't':
+      if (p[1]=='a' && p[2]=='g' && p[3]=='o' && p[4]=='f' && !alphanum(p[5])) return tTAGOF;
+      break;
+    case 'w':
+      if (p[1]=='h' && p[2]=='i' && p[3]=='l' && p[4]=='e' && !alphanum(p[5])) return tWHILE;
+      break;
+  }
+  return 0;
+}
+
 SC_FUNC void lexinit(void)
 {
   stkidx=0;             /* index for pushstk() and popstk() */
@@ -2058,6 +2223,7 @@ char *sc_tokens[] = {
 
 SC_FUNC int lex(cell *lexvalue,char **lexsym)
 {
+  g_lex_calls++;
   int i,toolong,newline;
   char **tokptr;
   const unsigned char *starttoken;
@@ -2079,7 +2245,13 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
     return 0;
 
   newline= (lptr==pline);       /* does lptr point to start of line buffer */
-  while (*lptr<=' ') {          /* delete leading white space */
+  /* Fast skip for common whitespace (spaces/tabs) */
+  if (*lptr==' ' || *lptr=='\t') {
+    do {
+      lptr++;
+    } while (*lptr==' ' || *lptr=='\t');
+  }
+  while (*lptr<=' ') {          /* delete remaining leading whitespace */
     if (*lptr=='\0') {
       preprocess();             /* preprocess resets "lptr" */
       if (!freading)
@@ -2114,6 +2286,34 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
     i+=1;
     tokptr+=1;
   } /* while */
+  /* Fast-path keyword/directive lookup. */
+  {
+    int kw = quick_keyword(lptr);
+    if (kw) {
+      _lextok = kw;
+      errorset(sRESET,0); /* reset error flag (clear the "panic mode")*/
+      if (pc_docexpr) {   /* optionally concatenate to documentation string */
+        /* Compute token length for documentation append. */
+        const unsigned char *p = lptr;
+        if (*p == '#') p++;
+        while (alphanum(*p)) p++;
+        char *doc = (char*)malloc((int)(p - lptr) + 1);
+        if (doc) {
+          memcpy(doc, lptr, (int)(p - lptr));
+          doc[(int)(p - lptr)]='\0';
+          insert_autolist(doc);
+          free(doc);
+        }
+      }
+      /* Advance lptr past the keyword/directive, including leading '#'. */
+      const unsigned char *p = lptr;
+      if (*p == '#') p++;
+      while (alphanum(*p)) p++;
+      lptr = (unsigned char*)p;
+      return _lextok;
+    }
+  }
+  /* Fallback: original linear scan for uncommon tokens. */
   while (i<=tLAST) {    /* match reserved words and compiler directives */
     if (*lptr==**tokptr && match(*tokptr,TRUE)) {
       _lextok=i;
@@ -2127,14 +2327,22 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
   } /* while */
 
   starttoken=lptr;      /* save start pointer (for concatenating to documentation string) */
-  if ((i=number(&_lexval,lptr))!=0) {   /* number */
-    _lextok=tNUMBER;
-    *lexvalue=_lexval;
-    lptr+=i;
-  } else if ((i=ftoi(&_lexval,lptr))!=0) {
-    _lextok=tRATIONAL;
-    *lexvalue=_lexval;
-    lptr+=i;
+  {
+    unsigned char c0 = *lptr;
+    unsigned char c1 = *(lptr+1);
+    int starts_number = ((c0 >= '0' && c0 <= '9') || (c0 == '.' && (c1 >= '0' && c1 <= '9')));
+    if (starts_number && (i=number(&_lexval,lptr))!=0) {   /* number */
+      _lextok=tNUMBER;
+      *lexvalue=_lexval;
+      lptr+=i;
+    } else if (starts_number && (i=ftoi(&_lexval,lptr))!=0) {
+      _lextok=tRATIONAL;
+      *lexvalue=_lexval;
+      lptr+=i;
+    } 
+  }
+  if (_lextok==tNUMBER || _lextok==tRATIONAL) {
+    /* already handled */
   } else if (alpha(*lptr)) {            /* symbol or label */
     /*  Note: only sNAMEMAX characters are significant. The compiler
      *        generates a warning if a symbol exceeds this length.
@@ -2592,7 +2800,10 @@ static cell litchar(const unsigned char **lptr,int flags)
  */
 static int alpha(char c)
 {
-  return (isalpha(c) || c=='_' || c==PUBLIC_CHAR);
+  unsigned char uc = (unsigned char)c;
+  // Fast ASCII alpha check without locale overhead.
+  // Accept A-Z, a-z, plus '_' and PUBLIC_CHAR.
+  return ((uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z') || c=='_' || c==PUBLIC_CHAR);
 }
 
 /*  alphanum
@@ -2601,7 +2812,9 @@ static int alpha(char c)
  */
 SC_FUNC int alphanum(char c)
 {
-  return (alpha(c) || isdigit(c));
+  unsigned char uc = (unsigned char)c;
+  // Fast ASCII alphanumeric check.
+  return (alpha(c) || (uc >= '0' && uc <= '9'));
 }
 
 /*  ishex
@@ -2628,13 +2841,16 @@ static symbol *add_symbol(symbol *root,symbol *entry,int sort)
     while (root->next!=NULL && strcmp(entry->name,root->next->name)>0)
       root=root->next;
 
-  if ((newsym=(symbol *)malloc(sizeof(symbol)))==NULL) {
+  if ((newsym=sym_alloc())==NULL) {
     error(103);
     return NULL;
   } /* if */
   memcpy(newsym,entry,sizeof(symbol));
   newsym->next=root->next;
   root->next=newsym;
+  /* Link parent->child for O(1) dependent lookup when applicable. */
+  if (newsym->parent != NULL && newsym->parent->child == NULL)
+    newsym->parent->child = newsym;
   if (global)
     AddToHashTable(sp_Globals, newsym);
   else
@@ -2678,7 +2894,7 @@ static void free_symbol(symbol *sym)
   free(sym->refer);
   if (sym->documentation!=NULL)
     free(sym->documentation);
-  free(sym);
+  sym_free(sym);
 }
 
 SC_FUNC void delete_symbol(symbol *root,symbol *sym)
@@ -2775,25 +2991,8 @@ SC_FUNC void delete_symbols(symbol *root,int level,int delete_labels,int delete_
       break;
     } /* switch */
     if (mustdelete) {
-      /* delete children in a single pass to avoid repeated O(n^2) scans */
-      int count = 0;
-      symbol *prev = root;
-      symbol *iter = root->next;
-      while (iter != NULL) {
-        if (iter->parent == sym) {
-          symbol *tod = iter;
-          iter = iter->next;
-          prev->next = iter;
-          if (root == &glbtab)
-            RemoveFromHashTable(sp_Globals, tod);
-          free_symbol(tod);
-          count++;
-          continue;
-        }
-        prev = iter;
-        iter = iter->next;
-      }
-      if (count == 0) {
+      /* If this symbol has no children, skip the full scan and delete fast. */
+      if (sym->child == NULL || sym->child == SC_NO_CHILD_SENTINEL) {
         if (root == &glbtab)
           RemoveFromHashTable(sp_Globals, sym);
         else if (root == &loctab)
@@ -2801,9 +3000,36 @@ SC_FUNC void delete_symbols(symbol *root,int level,int delete_labels,int delete_
         base->next = sym->next;
         free_symbol(sym);
       } else {
-        /* chain has changed */
-        delete_symbol(root, sym);
-        base = root;      /* restart */
+        /* delete children in a single pass to avoid repeated O(n^2) scans */
+        int count = 0;
+        symbol *prev = root;
+        symbol *iter = root->next;
+        while (iter != NULL) {
+          if (iter->parent == sym) {
+            symbol *tod = iter;
+            iter = iter->next;
+            prev->next = iter;
+            if (root == &glbtab)
+              RemoveFromHashTable(sp_Globals, tod);
+            free_symbol(tod);
+            count++;
+            continue;
+          }
+          prev = iter;
+          iter = iter->next;
+        }
+        if (count == 0) {
+          if (root == &glbtab)
+            RemoveFromHashTable(sp_Globals, sym);
+          else if (root == &loctab)
+            RemoveFromHashTable(sp_Locals, sym);
+          base->next = sym->next;
+          free_symbol(sym);
+        } else {
+          /* chain has changed */
+          delete_symbol(root, sym);
+          base = root;      /* restart */
+        }
       }
     } else {
       /* if the function was prototyped, but not implemented in this source,
@@ -2855,12 +3081,80 @@ static symbol *find_symbol(const symbol *root,const char *name,int fnumber,int i
 
 static symbol *find_symbol_child(const symbol *root,const symbol *sym)
 {
+  /* Fast path: if the parent already has its child linked, ensure
+   * the child belongs to the requested root (locals vs globals) and return it. */
+  if (sym && sym->child && sym->child != SC_NO_CHILD_SENTINEL) {
+    symbol *c = sym->child;
+    if ((root == &loctab && c->vclass == sLOCAL) || (root == &glbtab && c->vclass == sGLOBAL))
+      return c;
+  }
+  /* If negative memoization exists, no child will be found. */
+  if (sym && sym->child == SC_NO_CHILD_SENTINEL)
+    return NULL;
+  /* Prefer hash-bucket lookup when hash tables are available. */
+  if (sym) {
+    if (root == &loctab && sp_Locals) {
+      uint32_t bucket = sym->hash & sp_Locals->bucketmask;
+      HashEntry *he = sp_Locals->buckets[bucket];
+      while (he != NULL) {
+        symbol *cand = he->sym;
+        if (cand->parent == sym && cand->hash == sym->hash && strcmp(cand->name, sym->name) == 0)
+          return cand;
+        he = he->next;
+      }
+    } else if (root == &glbtab && sp_Globals) {
+      uint32_t bucket = sym->hash & sp_Globals->bucketmask;
+      HashEntry *he = sp_Globals->buckets[bucket];
+      while (he != NULL) {
+        symbol *cand = he->sym;
+        if (cand->parent == sym && cand->hash == sym->hash && strcmp(cand->name, sym->name) == 0)
+          return cand;
+        he = he->next;
+      }
+    }
+  }
+  /* Fallback: scan the list when hash tables are unavailable. */
   symbol *ptr=root->next;
   while (ptr!=NULL) {
-    if (ptr->parent==sym)
+    if (ptr->parent==sym && ptr->hash==sym->hash && strcmp(ptr->name, sym->name)==0)
       return ptr;
     ptr=ptr->next;
   } /* while */
+  return NULL;
+}
+
+/* Fast child lookup using hash buckets when available.
+ * Many dependent symbols (array levels) share the same name as the parent.
+ * We can leverage the symbol hash tables to quickly find a child by name
+ * without scanning entire lists.
+ */
+static symbol *find_child_by_name(const symbol *parent)
+{
+  if (parent == NULL)
+    return NULL;
+  uint32_t hash = NameHash(parent->name);
+  /* locals: newest first in buckets */
+  if (sp_Locals) {
+    uint32_t bucket = hash & sp_Locals->bucketmask;
+    HashEntry *he = sp_Locals->buckets[bucket];
+    while (he != NULL) {
+      symbol *sym = he->sym;
+      if (sym->parent == parent && strcmp(sym->name, parent->name) == 0)
+        return sym;
+      he = he->next;
+    }
+  }
+  /* globals: sorted by name in buckets */
+  if (sp_Globals) {
+    uint32_t bucket = hash & sp_Globals->bucketmask;
+    HashEntry *he = sp_Globals->buckets[bucket];
+    while (he != NULL) {
+      symbol *sym = he->sym;
+      if (sym->parent == parent && strcmp(sym->name, parent->name) == 0)
+        return sym;
+      he = he->next;
+    }
+  }
   return NULL;
 }
 
@@ -2997,10 +3291,27 @@ SC_FUNC symbol *findconst(const char *name)
 SC_FUNC symbol *finddepend(const symbol *parent)
 {
   symbol *sym;
-
-  sym=find_symbol_child(&loctab,parent);    /* try local symbols first */
-  if (sym==NULL)                            /* not found */
-    sym=find_symbol_child(&glbtab,parent);
+  if (parent==NULL)
+    return NULL;
+  /* Fast path: direct child pointer if available */
+  if (parent->child!=NULL && parent->child!=SC_NO_CHILD_SENTINEL)
+    return parent->child;
+  /* Memoized negative lookup: quickly return when we already know
+   * there is no dependent symbol for this parent. */
+  if (parent->child==SC_NO_CHILD_SENTINEL)
+    return NULL;
+  /* Prefer hash-bucket lookup by name when possible. */
+  sym = find_child_by_name(parent);
+  if (sym==NULL) {
+    /* Fallback to scan and link for future calls */
+    sym=find_symbol_child(&loctab,parent);    /* try local symbols first */
+    if (sym==NULL)
+      sym=find_symbol_child(&glbtab,parent);
+  }
+  if (sym!=NULL)
+    ((symbol*)parent)->child = sym;
+  else
+    ((symbol*)parent)->child = SC_NO_CHILD_SENTINEL;
   return sym;
 }
 
@@ -3042,11 +3353,14 @@ SC_FUNC symbol *addsym(const char *name,cell addr,int ident,int vclass,int tag,i
   entry.numrefers=1;
   entry.refer=refer;
   entry.parent=NULL;
+  entry.child=NULL;
   entry.fieldtag=0;
   entry.documentation=NULL;
 
   /* then insert it in the list */
   if (vclass==sGLOBAL)
+    /* Preserve original global sorting to avoid layout/offset changes
+     * that could affect runtime expectations. */
     return add_symbol(&glbtab,&entry,TRUE);
   return add_symbol(&loctab, &entry, FALSE);
 }
@@ -3076,6 +3390,9 @@ SC_FUNC symbol *addvariable(const char *name,cell addr,int ident,int vclass,int 
       top->dim.array.level=(short)(numdim-level-1);
       top->x.idxtag=idxtag[level];
       top->parent=parent;
+      top->child=NULL;
+      if (parent!=NULL)
+        parent->child=top;
       parent=top;
       if (level==0)
         sym=top;

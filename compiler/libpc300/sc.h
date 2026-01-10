@@ -125,6 +125,7 @@ typedef struct s_constvalue {
 typedef struct s_symbol {
   struct s_symbol *next;
   struct s_symbol *parent;  /* hierarchical types (multi-dimensional arrays) */
+  struct s_symbol *child;   /* direct first dependent/child for O(1) lookup */
   char name[sNAMEMAX+1];
   unsigned int hash;        /* value derived from name, for quicker searching */
   cell addr;            /* address or offset (or value for constant, index for native function) */
@@ -157,6 +158,14 @@ typedef struct s_symbol {
   int numrefers;        /* number of entries in the referrer list */
   char *documentation;  /* optional documentation string */
 } symbol;
+
+/* Sentinel for memoizing that a symbol has no dependent/child.
+ * This avoids repeated O(n) scans in finddepend() for non-array symbols.
+ * Valid child pointers are never equal to (symbol*)-1.
+ */
+#ifndef SC_NO_CHILD_SENTINEL
+#define SC_NO_CHILD_SENTINEL ((symbol*)-1)
+#endif
 
 
 /*  Possible entries for "ident". These are used in the "symbol", "value"
@@ -491,7 +500,9 @@ void *pc_openasm(char *filename); /* read/write */
 void pc_closeasm(void *handle,int deletefile);
 void pc_resetasm(void *handle);
 int  pc_writeasm(void *handle,char *str);
+int  pc_writeasm_len(void *handle,const char *str,int len);
 char *pc_readasm(void *handle,char *target,int maxchars);
+int  pc_readasm_ptr(void *handle,char **ptr,int *len);
 
 /* output to binary (.AMX) file */
 void *pc_openbin(char *filename);
@@ -538,6 +549,14 @@ SC_FUNC void inst_file_name(char* filename, int strip_path);
 
 /* function prototypes in SC2.C */
 #define PUSHSTK_P(v)  { stkitem s_; s_.pv=(v); pushstk(s_); }
+
+/* Lightweight instrumentation counters */
+SC_VDECL unsigned long g_lex_calls;
+SC_VDECL unsigned long g_preprocess_calls;
+SC_VDECL unsigned long g_outbuf_direct_lines;
+SC_VDECL unsigned long g_outbuf_flush_on_newline;
+SC_VDECL unsigned long g_outbuf_partial_flushes;
+SC_VDECL unsigned long g_outbuf_bytes_flushed;
 #define PUSHSTK_I(v)  { stkitem s_; s_.i=(v); pushstk(s_); }
 #define POPSTK_P()    (popstk().pv)
 #define POPSTK_I()    (popstk().i)
@@ -736,6 +755,7 @@ unsigned int mfwrite(MEMFILE *mf,unsigned char *buffer,unsigned int size);
 unsigned int mfread(MEMFILE *mf,unsigned char *buffer,unsigned int size);
 char *mfgets(MEMFILE *mf,char *string,unsigned int size);
 int mfputs(MEMFILE *mf,char *string);
+int mfreadlineptr(MEMFILE *mf,char **ptr,int *len);
 
 /* function prototypes in SCI18N.C */
 #define MAXCODEPAGE 12

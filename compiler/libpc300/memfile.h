@@ -36,5 +36,9 @@ void memfile_seek(memfile_t *mf, long seek);
 int memfile_write(memfile_t *mf, void *buffer, size_t size);
 size_t memfile_read(memfile_t *mf, void *buffer, size_t maxsize);
 long memfile_tell(memfile_t *mf);
+/* Return next line pointer and length without copying. Returns 1 if a line
+ * was returned, 0 on EOF. The returned pointer is valid until the memfile
+ * is modified. Advances the internal offset past the returned line. */
+int memfile_readline_ptr(memfile_t *mf, const char **ptr, int *len);
 
 #endif //_INCLUDE_MEMFILE_H

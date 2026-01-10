@@ -345,6 +345,15 @@ int pc_writeasm(void *handle,char *string)
   #endif
 }
 
+int pc_writeasm_len(void *handle,const char *string,int len)
+{
+  #if defined __MSDOS__ || defined SC_LIGHT
+    return (int)fwrite(string,1,(size_t)len,(FILE*)handle) == len;
+  #else
+    return (int)mfwrite((MEMFILE*)handle,(unsigned char*)string,(unsigned int)len) == (unsigned int)len;
+  #endif
+}
+
 char *pc_readasm(void *handle, char *string, int maxchars)
 {
   #if defined __MSDOS__ || defined SC_LIGHT
@@ -352,6 +361,17 @@ char *pc_readasm(void *handle, char *string, int maxchars)
   #else
     return mfgets((MEMFILE*)handle,string,maxchars);
   #endif
+}
+
+int pc_readasm_ptr(void *handle, char **ptr, int *len)
+{
+#if defined __MSDOS__ || defined SC_LIGHT
+  /* No zero-copy path for file-backed ASM; fall back to fgets. */
+  (void)handle; (void)ptr; (void)len;
+  return 0;
+#else
+  return mfreadlineptr((MEMFILE*)handle, ptr, len);
+#endif
 }
 
 /* Should return a pointer, which is used as a "magic cookie" to all I/O
@@ -672,6 +692,10 @@ int pc_compile(int argc, char *argv[])
   /* ===== INSTRUMENTATION: End FIRST pass ===== */
     clock_t t2_first = clock();
     fprintf(stderr, "[TIMING] FIRST pass: %.3f sec\n", (double)(t2_first - t1_first) / CLOCKS_PER_SEC);
+    fprintf(stderr, "[TIMING] lex() calls: %lu\n", g_lex_calls);
+    fprintf(stderr, "[TIMING] preprocess() calls: %lu\n", g_preprocess_calls);
+    g_lex_calls = 0;
+    g_preprocess_calls = 0;
   }
   /* ===== END INSTRUMENTATION ===== */
 
@@ -750,6 +774,12 @@ int pc_compile(int argc, char *argv[])
   /* ===== INSTRUMENTATION: End WRITE phase ===== */
     clock_t t2_write = clock();
     fprintf(stderr, "[TIMING] WRITE phase: %.3f sec\n", (double)(t2_write - t1_write) / CLOCKS_PER_SEC);
+    fprintf(stderr, "[TIMING] outbuf: direct_lines=%lu flush_newline=%lu partial_flushes=%lu bytes=%lu\n",
+            g_outbuf_direct_lines, g_outbuf_flush_on_newline, g_outbuf_partial_flushes, g_outbuf_bytes_flushed);
+    g_outbuf_direct_lines = 0;
+    g_outbuf_flush_on_newline = 0;
+    g_outbuf_partial_flushes = 0;
+    g_outbuf_bytes_flushed = 0;
   }
   /* ===== END INSTRUMENTATION ===== */
 
@@ -2806,6 +2836,8 @@ static void decl_enum(int vclass)
     sym->dim.array.length=size;
     sym->dim.array.level=0;
     sym->parent=enumsym;
+    if (enumsym!=NULL && enumsym->child==NULL)
+      enumsym->child=sym;  /* link first enum field for quick dependent lookup */
     /* add the constant to a separate list as well */
     if (enumroot!=NULL) {
       sym->usage |= uENUMFIELD;
@@ -5587,6 +5619,7 @@ static void doreturn(void)
           /* nothing */;
         sub=addvariable(curfunc->name,(argcount+3)*sizeof(cell),iREFARRAY,sGLOBAL,curfunc->tag,dim,numdim,idxtag);
         sub->parent=curfunc;
+        curfunc->child=sub;    /* direct link for fast finddepend(curfunc) */
         /* Function that returns array can be used before it is defined, so at
          * the call point (if it is before definition) we may not know if this
          * function returns array and what is its size (for example inside the
