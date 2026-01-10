@@ -193,18 +193,93 @@ SC_FUNC void stgwrite(const char *st)
     stgidx += (int)slen;
     stgbuf[stgidx++]='\0';
   } else {
-    /* Streaming mode for non-staging: write fragments directly to the
-     * output (memfile) to avoid an extra memcpy into stgbuf. Lines may be
-     * assembled across multiple writes, which is fine because the assembler
-     * reads the complete buffer afterwards.
-     */
     size_t slen = strlen(st);
-    if (slen == 0)
-      return;
-    filewrite_len((char*)st,(int)slen);
-    g_outbuf_bytes_flushed += (unsigned long)slen;
-    if (st[slen - 1] == '\n')
-      g_outbuf_direct_lines++;
+    /* If incoming fragment ends with a newline, prefer direct writes.
+     * - When buffer is empty: write the fragment directly.
+     * - When buffer has pending data: flush pending buffer, then write
+     *   the fragment directly, avoiding an extra memcpy into stgbuf. */
+    if (slen > 0 && st[slen - 1] == '\n') {
+      if (outbuf_len == 0) {
+        filewrite_len((char*)st,(int)slen);
+        g_outbuf_direct_lines++;
+        g_outbuf_bytes_flushed += (unsigned long)slen;
+        return;
+      } else {
+        /* If the tail is small, append then flush once; else do flush+direct. */
+        if ((int)slen <= SMALL_TAIL_BATCH) {
+          CHECK_STGBUFFER(outbuf_len + (int)slen + 1);
+          memcpy(stgbuf + outbuf_len, st, slen);
+          outbuf_len += (int)slen;
+          stgbuf[outbuf_len] = '\0';
+          /* update last newline to the end of the buffer */
+          outbuf_last_nl = outbuf_len - 1;
+          filewrite_len(stgbuf + outbuf_start, outbuf_len - outbuf_start);
+          g_outbuf_flush_on_newline++;
+          g_outbuf_bytes_flushed += (unsigned long)(outbuf_len - outbuf_start);
+          outbuf_len = 0;
+          outbuf_start = 0;
+          outbuf_last_nl = -1;
+          stgbuf[0] = '\0';
+          return;
+        } else {
+          /* Flush existing pending buffer segment, then write the tail. */
+          filewrite_len(stgbuf + outbuf_start, outbuf_len - outbuf_start);
+          g_outbuf_flush_on_newline++;
+          g_outbuf_bytes_flushed += (unsigned long)(outbuf_len - outbuf_start);
+          filewrite_len((char*)st,(int)slen);
+          g_outbuf_bytes_flushed += (unsigned long)slen;
+          outbuf_len = 0;
+          outbuf_start = 0;
+          outbuf_last_nl = -1;
+          stgbuf[0] = '\0';
+          return;
+        }
+      }
+    }
+    CHECK_STGBUFFER(outbuf_len + (int)slen + 1);
+    memcpy(stgbuf + outbuf_len, st, slen);
+    /* Track last newline in the newly appended fragment to avoid full scans. */
+    if (slen > 0) {
+      int base = outbuf_len;
+      const char *p = st;
+      /* scan backwards for efficiency to find the last newline in the fragment */
+      for (int i = (int)slen - 1; i >= 0; --i) {
+        if (p[i] == '\n') { outbuf_last_nl = base + i; break; }
+      }
+    }
+    outbuf_len += (int)slen;
+    stgbuf[outbuf_len] = '\0';
+    if (outbuf_len > 0 && stgbuf[outbuf_len - 1] == '\n') {
+      /* Flush the full pending buffer segment without shifting remainder. */
+      filewrite_len(stgbuf + outbuf_start, outbuf_len - outbuf_start);
+      g_outbuf_flush_on_newline++;
+      g_outbuf_bytes_flushed += (unsigned long)(outbuf_len - outbuf_start);
+      outbuf_len = 0;
+      outbuf_start = 0;
+      outbuf_last_nl = -1;
+      stgbuf[0] = '\0';
+    } else if (outbuf_len >= OUTBUF_FLUSH_LIMIT) {
+      /* Find the last newline and flush up to it, preserving the remainder. */
+      int pos = outbuf_last_nl;
+      if (pos < outbuf_start) {
+        /* fallback: last newline unknown or before start, scan buffer tail */
+        pos = outbuf_len - 1;
+        while (pos >= outbuf_start && stgbuf[pos] != '\n')
+          pos--;
+      }
+      if (pos >= 0) {
+        /* Temporarily terminate after newline, flush, then advance start. */
+        char save = stgbuf[pos + 1];
+        stgbuf[pos + 1] = '\0';
+        filewrite_len(stgbuf + outbuf_start, (pos + 1) - outbuf_start);
+        g_outbuf_partial_flushes++;
+        g_outbuf_bytes_flushed += (unsigned long)((pos + 1) - outbuf_start);
+        stgbuf[pos + 1] = save;
+        outbuf_start = pos + 1;
+        if (outbuf_last_nl < outbuf_start)
+          outbuf_last_nl = -1;
+      }
+    }
   }
 }
 
