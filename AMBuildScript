@@ -521,7 +521,7 @@ if builder.target_platform == 'windows':
 if builder.backend == 'amb2':
   builder.RunBuildScripts([
     #   'plugins/AMBuilder',
-    #   'support/PackageScript',
+       'support/PackageScript',
     ],
     { 'AMXX': AMXX }
   )
