@@ -108,6 +108,10 @@ public:
 	
 	static void FmtGenericMsg(AMX *amx, int error, char buffer[], size_t maxLength);
 	static void GenericMessage(AMX *amx, int error);
+	
+	// crashlib: resolve a bytecode offset to file + line + function
+	// Returns true if resolved, writes to out_file/out_line/out_func
+	bool LookupAddress(ucell addr, const char **out_file, long *out_line, const char **out_func);
 private:
 	void _CacheAmxOpcodeList();
 	

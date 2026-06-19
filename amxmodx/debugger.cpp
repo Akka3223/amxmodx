@@ -651,6 +651,16 @@ void Debugger::GenericMessage(AMX *amx, int err)
 		AMXXLOG_Error("[AMXX] %s", buffer);
 }
 
+bool Debugger::LookupAddress(ucell addr, const char **out_file, long *out_line, const char **out_func)
+{
+	if (!m_pAmxDbg) return false;
+
+	if (out_file)  dbg_LookupFile(m_pAmxDbg, addr, out_file);
+	if (out_line)  dbg_LookupLine(m_pAmxDbg, addr, out_line);
+	if (out_func)  dbg_LookupFunction(m_pAmxDbg, addr, out_func);
+	return true;
+}
+
 Debugger::~Debugger()
 {
 	Clear();

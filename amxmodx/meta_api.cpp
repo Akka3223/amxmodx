@@ -63,6 +63,9 @@ void (*endfunction)(void*);
 extern List<AUTHORIZEFUNC> g_auth_funcs;
 extern ke::Vector<CAdminData *> DynamicAdmins;
 
+// crashlib pawn dumper (modules.cpp)
+extern void crashlib_register_pawn_dumper(void);
+
 CLog g_log;
 CForwardMngr g_forwards;
 ke::Vector<ke::AutoPtr<CPlayer *>> g_auth;
@@ -509,6 +512,9 @@ int	C_Spawn(edict_t *pent)
 
 	g_plugins.Finalize();
 	g_plugins.InvalidateCache();
+
+	// Register crashlib pawn dumper (resolves .sma file:line on crash)
+	crashlib_register_pawn_dumper();
 
 	// Register forwards
 	FF_PluginInit = registerForward("plugin_init", ET_IGNORE, FP_DONE);

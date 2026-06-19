@@ -430,6 +430,63 @@ int AMXAPI amx_Flags(AMX *amx,uint16_t *flags)
 #if defined AMX_INIT
 int AMXAPI amx_Callback(AMX *amx, cell index, cell *result, cell *params)
 {
+  // crashlib: record which AMX instance is active (+ its CIP for later resolution)
+  static void **g_ca = nullptr;
+  static char  *g_pf = nullptr;
+  static cell  *g_cip = nullptr;
+  static int g_checked = 0;
+
+  // Cache the last lookup to skip redundant work
+  static AMX   *g_last_amx  = nullptr;
+  static cell   g_last_cip  = 0;
+
+  if (!g_checked)
+  {
+    g_checked = 1;
+    g_ca  = (void **)dlsym(RTLD_DEFAULT, "g_crashlib_active_amx");
+    g_pf  = (char *)  dlsym(RTLD_DEFAULT, "g_crashlib_pawn_func");
+    g_cip = (cell *)  dlsym(RTLD_DEFAULT, "g_crashlib_last_cip");
+  }
+  if (g_ca)  *g_ca  = (void *)amx;
+  if (g_cip) *g_cip = amx->cip;
+
+  // Only re-resolve if the context changed (amx or cip differs from last call)
+  if (g_pf && amx != g_last_amx) goto resolve;
+  if (g_pf && amx->cip != g_last_cip && amx->cip > 0) goto resolve;
+  goto skip_resolve;
+
+resolve:
+  g_last_amx = amx;
+  g_last_cip = amx->cip;
+  if (g_pf)
+  {
+    CPluginMngr::CPlugin *plugin = g_plugins.findPluginFast(amx);
+    if (plugin && amx->cip > 0)
+    {
+      AMX_HEADER *hdr = (AMX_HEADER *)amx->base;
+      const char *fn = nullptr;
+      if (hdr->magic == AMX_MAGIC && hdr->publics < hdr->natives)
+      {
+        cell *pub = (cell *)(amx->base + (int)hdr->publics);
+        int count = (int)(hdr->natives - hdr->publics) / (2 * (int)sizeof(cell));
+        // Binary search: find rightmost entry with addr <= cip
+        int lo = 0, hi = count, best = -1;
+        while (lo < hi) {
+          int mid = (lo + hi) / 2;
+          if (pub[mid * 2] <= amx->cip) { best = mid; lo = mid + 1; }
+          else hi = mid;
+        }
+        if (best >= 0)
+          fn = (const char *)(amx->base + (int)pub[best * 2 + 1]);
+      }
+      if (fn)
+        snprintf(g_pf, 128, "%s :: %s", plugin->getName(), fn);
+      else
+        snprintf(g_pf, 128, "%s", plugin->getName());
+    }
+  }
+skip_resolve: ;
+
   AMX_HEADER *hdr;
   AMX_FUNCSTUB *func;
   AMX_NATIVE f;

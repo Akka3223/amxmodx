@@ -64,6 +64,44 @@ void report_error(int code, const char* fmt, ...)
 	}
 }
 
+// ── crashlib integration ───────────────────────────────────────────
+
+#include <dlfcn.h>
+#include "debugger.h"
+
+typedef void (*crashlib_ring_write_fn)(int, const char *, const char *);
+static crashlib_ring_write_fn g_crashlib_ring_write = NULL;
+static int g_crashlib_checked = 0;
+
+static void crashlib_ensure_init(void) {
+	if (g_crashlib_checked) return;
+	g_crashlib_checked = 1;
+	g_crashlib_ring_write = (crashlib_ring_write_fn)dlsym(RTLD_DEFAULT, "crashlib_ring_write");
+}
+static void crashlib_maybe_log(int level, const char *module, const char *msg) {
+	crashlib_ensure_init();
+	if (g_crashlib_ring_write) g_crashlib_ring_write(level, module, msg);
+}
+
+typedef void (*crashlib_set_dumper_fn)(void (*)(int));
+static void crashlib_dump_pawn_stacks(int fd)
+{
+	char buf[512];
+	write(fd, "── Pawn plugin state ──\n", 24);
+	static char *g_pf = NULL; static int g_pf_c = 0;
+	if (!g_pf_c) { g_pf_c=1; g_pf=(char*)dlsym(RTLD_DEFAULT,"g_crashlib_pawn_func"); }
+	if (g_pf && g_pf[0]) {
+		int len = snprintf(buf,sizeof(buf),"  %s\n",g_pf);
+		if(len>0) write(fd,buf,len);
+	} else write(fd,"  (no Pawn context)\n",20);
+	write(fd,"── End Pawn state ──\n",22);
+}
+
+void crashlib_register_pawn_dumper(void) {
+	crashlib_set_dumper_fn s = (crashlib_set_dumper_fn)dlsym(RTLD_DEFAULT,"crashlib_set_pawn_dumper");
+	if(s) s(crashlib_dump_pawn_stacks);
+}
+
 void print_srvconsole(const char *fmt, ...)
 {
 	va_list argptr;
@@ -1520,6 +1558,9 @@ extern "C" void LogError(AMX *amx, int err, const char *fmt, ...)
 		//we can display error now
 		pDebugger->DisplayTrace(fmt ? msg_buffer : NULL);
 	}
+
+	CPluginMngr::CPlugin *plugin = g_plugins.findPluginFast(amx);
+	crashlib_maybe_log(3, "amxx", plugin ? plugin->getName() : "?");
 
 	amx->error = -1;
 }

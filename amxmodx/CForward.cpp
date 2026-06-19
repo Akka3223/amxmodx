@@ -10,6 +10,7 @@
 #include "amxmodx.h"
 #include "debugger.h"
 #include "binlog.h"
+#include <dlfcn.h>
 
 CForward::CForward(const char *name, ForwardExecType et, int numParams, const ForwardParam *paramTypes)
 {
@@ -262,6 +263,28 @@ cell CSPForward::execute(cell *params, ForwardPreparedArray *preparedArrays)
 		return 0;
 
 	m_InExec = true;
+
+	// crashlib: record which plugin + forward is executing
+	{
+		static char *g_pf = nullptr;
+		static int g_checked = 0;
+		static AMX     *g_last_amx = nullptr;
+		static int      g_last_id = -1;  // use plugin ID + forward name hash instead of raw pointer
+		if (!g_checked)
+		{
+			g_checked = 1;
+			g_pf = (char *)dlsym(RTLD_DEFAULT, "g_crashlib_pawn_func");
+		}
+		// Compare by identity (amx + forward name pointer from THIS call)
+		// m_Name.chars() is stable for the lifetime of this CSPForward call
+		if (g_pf && (m_Amx != g_last_amx || m_Name.chars() != (const char *)g_last_id))
+		{
+			g_last_amx = m_Amx;
+			g_last_id = (int)(uintptr_t)m_Name.chars();  // store as opaque id
+			snprintf(g_pf, 128, "%s :: %s",
+				pPlugin->getName(), m_Name.chars());
+		}
+	}
 
 	Debugger *pDebugger = (Debugger *)m_Amx->userdata[UD_DEBUGGER];
 	if (pDebugger)

@@ -291,6 +291,21 @@
         mov     dword [%1],eax
 %endmacro
 
+; Patch the bytecode offset (ebx - code_start) into the template.
+; Used to store amx->cip for crash backtraces on every native call.
+%macro putcip 1
+        push    eax
+        push    ecx
+        mov     eax, [amxhead]
+        mov     eax, [eax+_cod]
+        add     eax, [amxhead]
+        mov     ecx, ebx
+        sub     ecx, eax
+        mov     dword [%1], ecx
+        pop     ecx
+        pop     eax
+%endmacro
+
 ;
 ; Add an entry to the table of addresses which have to be relocated after the
 ; code compilation is done.
@@ -1735,13 +1750,17 @@ OP_BOUNDS:
 OP_SYSREQ_C:
 ;nop;
         putval  j_sysreq_c+1
+        putcip  j_sysreq_cip+3
         GO_ON   j_sysreq_c, OP_SYSREQ_PRI, 8
     j_sysreq_c:
-        mov     eax,12345678h   ; get function number
+        mov     eax,12345678h   ; get function number (patched by putval)
+        mov     ebp, amx        ; load AMX pointer (ecx is valid here)
+    j_sysreq_cip:
+        mov     dword [ebp+_cip], 12345678h  ; store CIP (patched by putcip)
+        ; ebp is clobbered by JIT_OP_SYSREQ on entry, no need to restore
     j_sysreq:
         call    [jit_sysreq]
 	CHECKCODESIZE j_sysreq_c
-        ; GWMV: oh well, it may look stupid, but I don't want to miss anything
         CHECKCODESIZE j_sysreq
 
 OP_SYSREQ_PRI:
