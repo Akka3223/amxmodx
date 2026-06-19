@@ -205,20 +205,24 @@ class AMXXConfig(object):
       '-Wno-format',
       '-Wno-format-security',
       '-m32',
+      '-g',
+      '-fno-omit-frame-pointer',
     ]
     cxx.cxxflags += [
       '-Wno-invalid-offsetof',
       '-std=c++11',
+      '-g',
+      '-fno-omit-frame-pointer',
     ]
 
-    cxx.linkflags += ['-m32']
+    cxx.linkflags += ['-m32', '-rdynamic']
 
     have_gcc = cxx.vendor == 'gcc'
     have_clang = cxx.vendor == 'clang'
 
     if have_clang or (have_gcc and cxx.version >= '4'):
-      cxx.cflags += ['-fvisibility=hidden']
-      cxx.cxxflags += ['-fvisibility-inlines-hidden']
+      # -fvisibility=hidden removed — crashlib/dladdr needs all symbols visible
+      # -rdynamic (above) exports them to .dynsym for backtrace resolution
       if have_clang or (have_gcc and cxx.version >= '4.6'):
         cxx.cflags += ['-Wno-narrowing']
       if (have_gcc and cxx.version >= '4.7') or (have_clang and cxx.version >= '3'):
