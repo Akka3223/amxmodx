@@ -323,6 +323,12 @@ CAmxxReader::Error CAmxxReader::GetSection(void *buffer)
 		char *tempBuffer = new char[m_SectionLength + 1];
 		fseek(m_pFile, pe->offs, SEEK_SET);
 		DATAREAD_RELEASE((void *)tempBuffer, 1, m_SectionLength);
+		if (pe->disksize == pe->imagesize)
+		{
+			memcpy(buffer, tempBuffer, m_SectionLength);
+			delete [] tempBuffer;
+			return Err_None;
+		}
 		uLongf destLen = GetBufferSize();
 		int result = uncompress((Bytef *)buffer, &destLen, (Bytef *)tempBuffer, m_SectionLength);
 		delete [] tempBuffer;
@@ -347,6 +353,12 @@ CAmxxReader::Error CAmxxReader::GetSection(void *buffer)
 		char *tempBuffer = new char[m_SectionLength + 1];
 		//fread(tempBuffer, sizeof(char), m_SectionLength, m_pFile);
 		DATAREAD_RELEASE((void*)tempBuffer, 1, m_SectionLength);
+		if (m_SectionLength == entry.origSize)
+		{
+			memcpy(buffer, tempBuffer, m_SectionLength);
+			delete [] tempBuffer;
+			return Err_None;
+		}
 		// decompress
 		int result = uncompress((Bytef *)buffer, &destLen, (Bytef *)tempBuffer, m_SectionLength);
 		delete [] tempBuffer;

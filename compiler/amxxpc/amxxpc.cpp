@@ -217,6 +217,15 @@ void Pl2Bh(abl *pl, BinPlugin *bh)
 
 bool CompressPl(abl *pl)
 {
+	const char *uncompressed = getenv("AMXX_UNCOMPRESSED");
+	if (uncompressed && uncompressed[0] == '1' && uncompressed[1] == '\0')
+	{
+		pl->cmpsize = pl->size;
+		pl->cmp = pl->data;
+		pl->data = NULL;
+		return true;
+	}
+
 	pl->cmpsize = compressBound(pl->size);
 	pl->cmp = new char[pl->cmpsize];
 
