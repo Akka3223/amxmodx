@@ -109,6 +109,7 @@ static long max_stacksize(symbol *root, int *recursion);
 static int testsymbols(symbol *root,int level,int testlabs,int testconst);
 static void destructsymbols(symbol *root,int level);
 static constvalue *find_constval_byval(constvalue *table,cell val);
+static int compare_constcase(const void *a,const void *b);
 static void statement(int *lastindent,int allow_decl);
 static void compound(int stmt_sameline);
 static int doexpr(int comma,int chkeffect,int allowarray,int mark_endexpr,
@@ -2707,7 +2708,6 @@ static cell needsub(int *tag,constvalue **enumroot)
 static void decl_const(int vclass)
 {
   char constname[sNAMEMAX+1];
-static int compare_constcase(const void *a,const void *b);
   cell val;
   char *str;
   int tag,exprtag;
