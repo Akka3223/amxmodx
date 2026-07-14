@@ -197,13 +197,18 @@ int load_amxscript_internal(AMX *amx, void **program, const char *filename, char
 		else if ((hdr->flags & AMX_FLAG_DEBUG) != 0)
 		{
 			will_be_debugged = true;
+			if (hdr->size < (int32_t)sizeof(AMX_HEADER) || (size_t)hdr->size > bufSize)
+			{
+				ke::SafeStrcpy(error, maxLength, "Invalid debug information");
+				return (amx->error = AMX_ERR_FORMAT);
+			}
 
 			char *addr = (char *)hdr + hdr->size;
 			pDbg = new tagAMX_DBG;
 
 			memset(pDbg, 0, sizeof(AMX_DBG));
 
-			int err = dbg_LoadInfo(pDbg, addr);
+			int err = dbg_LoadInfo(pDbg, addr, bufSize - hdr->size);
 
 			if (err != AMX_ERR_NONE)
 			{

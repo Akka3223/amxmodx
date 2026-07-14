@@ -66,12 +66,12 @@ typedef struct tagAMX_DBG_HDR {
   char    file_version; 		/* file format version */
   char    amx_version; 			/* required version of the AMX */
   int16_t flags         PACKED; /* currently unused */
-  int16_t files         PACKED; /* number of entries in the "file" table */
-  int16_t lines         PACKED; /* number of entries in the "line" table */
-  int16_t symbols       PACKED; /* number of entries in the "symbol" table */
-  int16_t tags          PACKED; /* number of entries in the "tag" table */
-  int16_t automatons    PACKED; /* number of entries in the "automaton" table */
-  int16_t states        PACKED; /* number of entries in the "state" table */
+  uint16_t files        PACKED; /* number of entries in the "file" table */
+  uint16_t lines        PACKED; /* number of entries in the "line" table */
+  uint16_t symbols      PACKED; /* number of entries in the "symbol" table */
+  uint16_t tags         PACKED; /* number of entries in the "tag" table */
+  uint16_t automatons   PACKED; /* number of entries in the "automaton" table */
+  uint16_t states       PACKED; /* number of entries in the "state" table */
 } AMX_DBG_HDR;
 #define AMX_DBG_MAGIC   0xf1ef
 
