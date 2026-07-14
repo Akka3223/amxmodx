@@ -488,9 +488,9 @@ AMXX.utf8rewind = builder.RunScript(
 
 builder.RunBuildScripts(
   [
-    # 'amxmodx/AMBuilder',
-    'compiler/amxxpc/AMBuilder',
-    'compiler/libpc300/AMBuilder',
+     'amxmodx/AMBuilder',
+    #'compiler/amxxpc/AMBuilder',
+    #'compiler/libpc300/AMBuilder',
     # 'modules/cstrike/cstrike/AMBuilder',
     # 'modules/cstrike/csx/AMBuilder',
     # 'modules/dod/dodfun/AMBuilder',
