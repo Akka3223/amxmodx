@@ -125,7 +125,7 @@ SC_FUNC void writeleader(symbol *root)
       {
         char line[sNAMEMAX + 4];
         int ln = 0, i;
-        const char *nm = sym->name ? sym->name : "";
+        const char *nm = sym->name;
         line[ln++]='\t'; line[ln++]=';'; line[ln++]=' ';
         for (i=0; nm[i] != '\0' && ln < (int)sizeof(line)-2; i++) line[ln++] = nm[i];
         line[ln++]='\n';
