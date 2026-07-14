@@ -2414,16 +2414,16 @@ static int nesting=0;
             /* the lengths for all dimensions must match, unless the dimension
              * length was defined at zero (which means "undefined")
              */
-              while (sym->dim.array.level>0) {
+            while (sym->dim.array.level>0) {
               assert(level<sDIMEN_MAX);
               if (arg[argidx].dim[level]!=0 && sym->dim.array.length!=arg[argidx].dim[level])
                 error(47);        /* array sizes must match */
               else if (!matchtag(arg[argidx].idxtag[level],sym->x.idxtag,TRUE))
                 error(229,sym->name);   /* index tag mismatch */
-                if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
-                  constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
-                  map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, level, cv);
-                }
+              if (IS_ARRAYSZ_NEEDED(arg[argidx].name)) {
+                constvalue *cv = append_constval(&arrayszlst,arg[argidx].name,sym->dim.array.length,level);
+                map_add(arraysz_map, &arraysz_count, (int)(sizeof(arraysz_map)/sizeof(arraysz_map[0])), arg[argidx].name, level, cv);
+              }
               sym=finddepend(sym);
               assert(sym!=NULL);
               level++;
